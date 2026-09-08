@@ -4,6 +4,13 @@ import { defineConfig, devices } from "@playwright/test";
 // This allows multiple test runs in parallel across different worktrees
 const baseURL =
   process.env.E2E_BASE_URL ?? `http://localhost:${process.env.E2E_METRO_PORT ?? "8081"}`;
+const relayDeploymentSpec = "**/relay-deployment-reconnect.real.spec.ts";
+
+function videoMode(): "on" | "on-first-retry" | "retain-on-failure" {
+  if (process.env.E2E_RECORD_VIDEO === "1") return "on";
+  if (process.env.CI) return "on-first-retry";
+  return "retain-on-failure";
+}
 
 export default defineConfig({
   testDir: "./e2e/browser",
@@ -20,9 +27,9 @@ export default defineConfig({
   reporter: [["list"]],
   use: {
     baseURL,
-    trace: "retain-on-failure",
+    trace: process.env.CI ? "on-first-retry" : "retain-on-failure",
     screenshot: "only-on-failure",
-    video: process.env.E2E_RECORD_VIDEO === "1" ? "on" : "retain-on-failure",
+    video: videoMode(),
   },
   projects: [
     {
@@ -33,6 +40,12 @@ export default defineConfig({
     {
       name: "real-provider",
       testMatch: ["**/*.real.spec.ts"],
+      testIgnore: [relayDeploymentSpec],
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "relay-deployment",
+      testMatch: [relayDeploymentSpec],
       use: { ...devices["Desktop Chrome"] },
     },
   ],

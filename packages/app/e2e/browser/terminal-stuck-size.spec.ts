@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "../support/fixtures";
-import { TerminalE2EHarness } from "../support/helpers/terminal-dsl";
+import { TerminalE2EHarness, withTerminalInApp } from "../support/helpers/terminal-dsl";
 import { getTerminalBufferText } from "../support/helpers/terminal-perf";
 import { buildHostWorkspaceRoute } from "../../src/utils/host-routes";
 import { getServerId } from "../support/helpers/server-id";
@@ -56,8 +56,15 @@ async function readRenderedTerminalSize(page: Page): Promise<RenderedTerminalSiz
 }
 
 async function createTerminalViaMenu(page: Page): Promise<void> {
-  await page.getByTestId("workspace-new-tab-menu-trigger").click();
-  await page.getByTestId("workspace-new-tab-menu-terminal").click();
+  // Workspaces always render a hidden explorer companion pane alongside the
+  // main pane, so an unscoped testid locator matches both; scope to the
+  // visible one.
+  await page.getByTestId("workspace-new-tab-button").filter({ visible: true }).click();
+  await page
+    .getByTestId("workspace-new-tab-menu-terminal")
+    .filter({ visible: true })
+    .first()
+    .click();
 }
 
 async function listTerminalIds(harness: TerminalE2EHarness): Promise<string[]> {
@@ -90,6 +97,23 @@ function parseLatestSttySize(bufferText: string): RenderedTerminalSize | null {
   return match?.[1] && match[2] ? { rows: Number(match[1]), cols: Number(match[2]) } : null;
 }
 
+async function captureTerminalText(
+  harness: TerminalE2EHarness,
+  terminalId: string,
+): Promise<string> {
+  const capture = await harness.client.captureTerminal(terminalId, { stripAnsi: true });
+  return capture.lines.join("\n");
+}
+
+async function waitForTerminalMarker(page: Page, marker: string): Promise<void> {
+  await expect
+    .poll(() => getTerminalBufferText(page), {
+      message: "terminal stream should deliver PTY output after focus returns",
+      timeout: 10_000,
+    })
+    .toContain(marker);
+}
+
 test.describe("terminal PTY size claim under lost window focus", () => {
   let harness: TerminalE2EHarness;
 
@@ -107,7 +131,9 @@ test.describe("terminal PTY size claim under lost window focus", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
 
     await page.goto(buildHostWorkspaceRoute(getServerId(), harness.workspaceId));
-    await expect(page.getByTestId("workspace-new-tab-menu-trigger")).toBeVisible({
+    await expect(
+      page.getByTestId("workspace-new-tab-button").filter({ visible: true }),
+    ).toBeVisible({
       timeout: 30_000,
     });
 
@@ -140,7 +166,7 @@ test.describe("terminal PTY size claim under lost window focus", () => {
       data: 'echo "S0=$(stty size)="\n',
     });
     await expect
-      .poll(async () => getTerminalBufferText(page), { timeout: 15_000 })
+      .poll(async () => captureTerminalText(harness, newTerminalId), { timeout: 15_000 })
       .toMatch(/S0=24 80=/);
 
     // ...and comes back.
@@ -161,10 +187,28 @@ test.describe("terminal PTY size claim under lost window focus", () => {
             type: "input",
             data: `echo "S${probe++}=$(stty size)="\n`,
           });
-          return parseLatestSttySize(await getTerminalBufferText(page));
+          return parseLatestSttySize(await captureTerminalText(harness, newTerminalId));
         },
         { timeout: 15_000, intervals: [100, 250, 500] },
       )
       .toEqual({ rows: rendered.rows, cols: rendered.cols });
+  });
+
+  test("terminal output remains subscribed after window focus returns", async ({ page }) => {
+    await withTerminalInApp(page, harness, { name: "focus-return-output" }, async (terminal) => {
+      const marker = `OUTPUT_AFTER_FOCUS_${Date.now()}`;
+
+      await setWindowFocused(page, false);
+      await page.waitForTimeout(50);
+      await setWindowFocused(page, true);
+      await page.waitForTimeout(50);
+
+      harness.client.sendTerminalInput(terminal.id, {
+        type: "input",
+        data: `printf "\\n${marker}\\n"\n`,
+      });
+
+      await waitForTerminalMarker(page, marker);
+    });
   });
 });

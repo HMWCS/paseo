@@ -77,9 +77,9 @@ export async function expectWorkspaceContextMenuActions(
 ): Promise<void> {
   const workspaceKey = `${getServerId()}:${workspaceId}`;
   const menu = page.getByTestId(`sidebar-workspace-context-menu-${workspaceKey}`);
-  await expect(menu.getByRole("button", { name: "Copy path" })).toBeVisible();
-  await expect(menu.getByRole("button", { name: "Rename workspace" })).toBeVisible();
-  await expect(menu.getByRole("button", { name: "Archive" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Copy path" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Rename workspace" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Archive" })).toBeVisible();
 }
 
 export async function openProjectContextMenu(page: Page, projectViewKey: string): Promise<void> {
@@ -101,8 +101,8 @@ export async function expectProjectContextMenuActions(
   projectViewKey: string,
 ): Promise<void> {
   const menu = page.getByTestId(`sidebar-project-context-menu-${projectViewKey}`);
-  await expect(menu.getByRole("button", { name: "Open project settings" })).toBeVisible();
-  await expect(menu.getByRole("button", { name: "Remove project" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Open project settings" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "Remove project" })).toBeVisible();
 }
 
 export async function selectWorkspaceInSidebar(page: Page, workspaceId: string): Promise<void> {
@@ -164,6 +164,40 @@ export async function expectWorkspaceAbsentFromSidebar(
   await expect(
     page.getByTestId(`sidebar-workspace-row-${getServerId()}:${workspaceId}`),
   ).toHaveCount(0, { timeout: 30_000 });
+}
+
+// The display-preferences menu is one row per decision, and the options sit a page below that
+// row. Every caller has to walk the same path, so it lives here: when the menu's shape moves
+// again, this is the only place that has to follow.
+export async function openSidebarDisplayPage(page: Page, branchTestID: string): Promise<void> {
+  await page.getByTestId("sidebar-display-preferences-menu").click();
+  await page.getByTestId(branchTestID).click();
+}
+
+// Project filters live a page below the display-preferences root, like the host filters.
+export async function openSidebarProjectFilter(page: Page): Promise<void> {
+  await openSidebarDisplayPage(page, "sidebar-display-project-filter");
+}
+
+// The filter rows are keyed by the project's sidebar view key. A project seeded from its own temp
+// repo has a `projectKey` unique on the host, so the view key IS that key — see
+// `buildWorkspaceStructureProjects`.
+export async function toggleProjectFilter(page: Page, projectViewKey: string): Promise<void> {
+  await page.getByTestId(`sidebar-project-filter-${projectViewKey}`).click();
+}
+
+export async function selectAllProjectsFilter(page: Page): Promise<void> {
+  await page.getByTestId("sidebar-project-filter-all").click();
+}
+
+export async function closeSidebarDisplayPreferences(page: Page): Promise<void> {
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("sidebar-display-preferences-content")).toHaveCount(0);
+}
+
+export async function selectSidebarStatusGrouping(page: Page): Promise<void> {
+  await openSidebarDisplayPage(page, "sidebar-display-grouping");
+  await page.getByTestId("sidebar-grouping-status").click();
 }
 
 export async function openMobileAgentSidebar(page: Page): Promise<void> {

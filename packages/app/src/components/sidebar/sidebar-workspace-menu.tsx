@@ -2,8 +2,17 @@ import { useMemo, type ComponentProps, type PropsWithChildren, type ReactNode } 
 import { useTranslation } from "react-i18next";
 import { type PressableStateCallbackType } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { Archive, CircleCheck, Copy, MoreVertical, Pencil, Pin, PinOff } from "lucide-react-native";
-import { isNative, isWeb } from "@/constants/platform";
+import {
+  Archive,
+  CircleCheck,
+  Copy,
+  MoreVertical,
+  Pencil,
+  Pin,
+  PinOff,
+  Tag,
+} from "lucide-react-native";
+import { isWeb } from "@/constants/platform";
 import { getForgePresentation, normalizeForge } from "@/git/forge";
 import type { SidebarWorkspaceEntry } from "@/hooks/use-sidebar-workspaces-list";
 import { useAppSettings } from "@/hooks/use-settings";
@@ -13,6 +22,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -24,6 +34,15 @@ import {
 import { Shortcut } from "@/components/ui/shortcut";
 import { OpenInFileManagerMenuItem } from "@/workspace/open-in-file-manager/menu-item";
 import { resolveSidebarWorkspaceAccessibilityLabel } from "@/components/sidebar/sidebar-workspace-title";
+import {
+  workspaceServiceLabelKey,
+  type WorkspaceServiceSummary,
+} from "@/components/sidebar/workspace-meta-row";
+import {
+  useWorkspaceLabelMenuPages,
+  WORKSPACE_LABEL_PAGE_ID,
+  type WorkspaceLabelTarget,
+} from "@/workspace-labels/picker";
 
 const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foreground });
 const foregroundMutedColorMapping = (theme: Theme) => ({
@@ -37,6 +56,7 @@ const ThemedPencil = withUnistyles(Pencil);
 const ThemedCircleCheck = withUnistyles(CircleCheck);
 const ThemedPin = withUnistyles(Pin);
 const ThemedPinOff = withUnistyles(PinOff);
+const ThemedTag = withUnistyles(Tag);
 
 const copyLeadingIcon = <ThemedCopy size={14} uniProps={foregroundMutedColorMapping} />;
 const renameLeadingIcon = <ThemedPencil size={14} uniProps={foregroundMutedColorMapping} />;
@@ -58,6 +78,9 @@ function renderTriggerIcon({ hovered }: { hovered?: boolean }) {
 
 export interface SidebarWorkspaceMenuProps {
   workspaceKey: string;
+  serverId?: string;
+  workspaceId?: string;
+  workspaceLabels?: readonly string[];
   onCopyPath?: () => void;
   onCopyBranchName?: () => void;
   onRename?: () => void;
@@ -70,9 +93,18 @@ export interface SidebarWorkspaceMenuProps {
   isPinned?: boolean;
   onTogglePin?: () => void;
   openInFileManagerPath?: string | null;
+  /**
+   * Lifted so the row that reveals the kebab can keep it mounted while its menu is up. See
+   * `useOpenKebabMenuVisibility`.
+   */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
-interface SidebarWorkspaceMenuItemsProps extends Omit<SidebarWorkspaceMenuProps, "onArchive"> {
+interface SidebarWorkspaceMenuItemsProps extends Omit<
+  SidebarWorkspaceMenuProps,
+  "onArchive" | "open" | "onOpenChange"
+> {
   onArchive?: () => void;
 }
 
@@ -94,6 +126,8 @@ function WorkspaceMenuItem({
 function SidebarWorkspaceMenuItems({
   surface,
   workspaceKey,
+  serverId,
+  workspaceId,
   onCopyPath,
   onCopyBranchName,
   onRename,
@@ -109,8 +143,12 @@ function SidebarWorkspaceMenuItems({
 }: SidebarWorkspaceMenuItemsProps & { surface: MenuSurface }): ReactNode {
   const { t } = useTranslation();
   const archiveTrailing = useMemo(
-    () => (archiveShortcutKeys && !isNative ? <Shortcut chord={archiveShortcutKeys} /> : null),
+    () => (archiveShortcutKeys ? <Shortcut chord={archiveShortcutKeys} /> : null),
     [archiveShortcutKeys],
+  );
+  const labelLeading = useMemo(
+    () => <ThemedTag size={14} uniProps={foregroundMutedColorMapping} />,
+    [],
   );
 
   return (
@@ -165,6 +203,15 @@ function SidebarWorkspaceMenuItems({
           {isPinned ? t("sidebar.workspace.actions.unpin") : t("sidebar.workspace.actions.pin")}
         </WorkspaceMenuItem>
       ) : null}
+      {serverId && workspaceId ? (
+        <DropdownMenuSubTrigger
+          id={WORKSPACE_LABEL_PAGE_ID}
+          leading={labelLeading}
+          testID={`sidebar-workspace-menu-labels-${workspaceKey}`}
+        >
+          {t("workspaceLabels.title")}
+        </DropdownMenuSubTrigger>
+      ) : null}
       <OpenInFileManagerMenuItem
         surface={surface}
         path={openInFileManagerPath}
@@ -189,6 +236,9 @@ function SidebarWorkspaceMenuItems({
 
 export function SidebarWorkspaceMenu({
   workspaceKey,
+  serverId,
+  workspaceId,
+  workspaceLabels,
   onCopyPath,
   onCopyBranchName,
   onRename,
@@ -201,10 +251,18 @@ export function SidebarWorkspaceMenu({
   isPinned,
   onTogglePin,
   openInFileManagerPath,
+  open,
+  onOpenChange,
 }: SidebarWorkspaceMenuProps) {
   const { t } = useTranslation();
+  const workspaceTarget = useMemo<WorkspaceLabelTarget | null>(
+    () =>
+      serverId && workspaceId ? { serverId, workspaceId, labels: workspaceLabels ?? [] } : null,
+    [serverId, workspaceId, workspaceLabels],
+  );
+  const pages = useWorkspaceLabelMenuPages(workspaceTarget);
   return (
-    <DropdownMenu>
+    <DropdownMenu compactMode="sheet" open={open} onOpenChange={onOpenChange}>
       <DropdownMenuTrigger
         hitSlop={8}
         style={triggerStyle}
@@ -214,10 +272,18 @@ export function SidebarWorkspaceMenu({
       >
         {renderTriggerIcon}
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" width={260}>
+      <DropdownMenuContent
+        align="end"
+        width={260}
+        pages={pages}
+        sheetTitle={t("sidebar.workspace.actions.menu")}
+      >
         <SidebarWorkspaceMenuItems
           surface="dropdown"
           workspaceKey={workspaceKey}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          workspaceLabels={workspaceLabels}
           onCopyPath={onCopyPath}
           onCopyBranchName={onCopyBranchName}
           onRename={onRename}
@@ -238,7 +304,7 @@ export function SidebarWorkspaceMenu({
 
 type ContextTriggerProps = Omit<
   ComponentProps<typeof ContextMenuTrigger>,
-  "children" | "enabledOnMobile"
+  "children" | "enabledOnMobile" | "highlightStyle"
 >;
 
 export function SidebarWorkspaceContextMenu({
@@ -248,7 +314,7 @@ export function SidebarWorkspaceContextMenu({
   workspace,
   leadingProjectName,
   hostBadgeLabel,
-  scriptIconKind,
+  serviceSummary,
   workspaceKey,
   onCopyPath,
   onCopyBranchName,
@@ -263,6 +329,7 @@ export function SidebarWorkspaceContextMenu({
   onTogglePin,
   openInFileManagerPath,
   accessibilityLabel,
+  highlightStyle,
   ...triggerProps
 }: PropsWithChildren<
   SidebarWorkspaceMenuItemsProps &
@@ -272,7 +339,8 @@ export function SidebarWorkspaceContextMenu({
       workspace: SidebarWorkspaceEntry;
       leadingProjectName?: string | null;
       hostBadgeLabel?: string | null;
-      scriptIconKind?: "service" | "command" | null;
+      serviceSummary?: WorkspaceServiceSummary | null;
+      highlightStyle: ComponentProps<typeof ContextMenuTrigger>["highlightStyle"];
     }
 >) {
   const {
@@ -291,8 +359,19 @@ export function SidebarWorkspaceContextMenu({
     leadingProjectName,
     hostBadgeLabel,
     pullRequestLabel,
-    scriptLabel: scriptIconKind ? t("workspace.status.scriptsAvailable") : null,
+    serviceLabel: serviceSummary
+      ? t(workspaceServiceLabelKey(serviceSummary), { name: serviceSummary.name })
+      : null,
   });
+  const workspaceTarget = useMemo<WorkspaceLabelTarget>(
+    () => ({
+      serverId: workspace.serverId,
+      workspaceId: workspace.workspaceId,
+      labels: workspace.labels ?? [],
+    }),
+    [workspace],
+  );
+  const pages = useWorkspaceLabelMenuPages(workspaceTarget);
 
   return (
     <ContextMenu open={contextMenuOpen} onOpenChange={onContextMenuOpenChange}>
@@ -300,6 +379,7 @@ export function SidebarWorkspaceContextMenu({
         {...triggerProps}
         enabledOnMobile={false}
         accessibilityLabel={accessibilityLabel ?? rowAccessibilityLabel}
+        highlightStyle={highlightStyle}
       >
         {children}
       </ContextMenuTrigger>
@@ -307,10 +387,14 @@ export function SidebarWorkspaceContextMenu({
         align="start"
         width={260}
         testID={`sidebar-workspace-context-menu-${workspaceKey}`}
+        pages={pages}
       >
         <SidebarWorkspaceMenuItems
           surface="context"
           workspaceKey={workspaceKey}
+          serverId={workspaceTarget.serverId}
+          workspaceId={workspaceTarget.workspaceId}
+          workspaceLabels={workspaceTarget.labels}
           onCopyPath={onCopyPath}
           onCopyBranchName={onCopyBranchName}
           onRename={onRename}
@@ -338,6 +422,9 @@ const styles = StyleSheet.create((theme) => ({
     padding: 2,
     borderRadius: 4,
     marginLeft: 2,
+    // MoreVertical paints only around the center of its SVG. Keep the padded hit box, but
+    // pull the painted dots through that unused view-box space onto the trailing-content rail.
+    marginRight: -7,
   },
   triggerHovered: {
     backgroundColor: theme.colors.surface2,

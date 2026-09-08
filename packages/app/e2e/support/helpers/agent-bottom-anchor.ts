@@ -1,4 +1,4 @@
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 
 const NEAR_BOTTOM_THRESHOLD_PX = 72;
 const DEFAULT_SCROLL_TOLERANCE_PX = 24;
@@ -12,6 +12,31 @@ export interface ScrollMetrics {
 
 function getVisibleChatScroll(page: Page) {
   return page.locator('[data-testid="agent-chat-scroll"]:visible').first();
+}
+
+interface PositionedToolCall {
+  locator: Locator;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
+async function readRenderedToolCalls(toolCalls: Locator): Promise<PositionedToolCall[]> {
+  const entries = await Promise.all(
+    Array.from({ length: await toolCalls.count() }, async (_, index) => ({
+      locator: toolCalls.nth(index),
+      bounds: await toolCalls.nth(index).boundingBox(),
+    })),
+  );
+  return entries.filter(
+    (entry): entry is PositionedToolCall => entry.bounds !== null && entry.bounds.width > 0,
+  );
+}
+
+function closestToolCallToY(toolCalls: PositionedToolCall[], targetY: number) {
+  return toolCalls.toSorted(
+    (left, right) =>
+      Math.abs(left.bounds.y + left.bounds.height / 2 - targetY) -
+      Math.abs(right.bounds.y + right.bounds.height / 2 - targetY),
+  )[0];
 }
 
 export async function readScrollMetrics(page: Page): Promise<ScrollMetrics> {
@@ -102,6 +127,8 @@ export async function waitForScrollableChat(
     .toBeGreaterThan(input.minScrollableDistance);
 }
 
+const WHEEL_SETTLE_TIMEOUT_MS = 5_000;
+
 export async function scrollChatAwayFromBottom(
   page: Page,
   input: { deltaY: number; minDistanceFromBottom: number },
@@ -111,31 +138,41 @@ export async function scrollChatAwayFromBottom(
   if (!box) {
     throw new Error("Agent chat scroll container is not visible");
   }
-  const wheelSettled = scroll.evaluate(
-    (root: Element) =>
-      new Promise<void>((resolve) => {
-        root.addEventListener(
-          "wheel",
-          () => {
-            const scrollElement = root as HTMLElement;
-            let previousOffset = scrollElement.scrollTop;
-            let stableFrames = 0;
-            const sample = () => {
-              const currentOffset = scrollElement.scrollTop;
-              stableFrames = Math.abs(currentOffset - previousOffset) <= 0.5 ? stableFrames + 1 : 0;
-              previousOffset = currentOffset;
-              if (stableFrames >= 3) {
-                resolve();
-                return;
-              }
-              requestAnimationFrame(sample);
-            };
-            requestAnimationFrame(sample);
-          },
-          { once: true },
-        );
-      }),
-  );
+  // Letting the scroll animation stop before measuring is an optimization, so it must never be
+  // the thing that decides the test — the assertion below is. The old wait could not say that:
+  // it resolved only from a `requestAnimationFrame` sampler started by a `wheel` listener, and
+  // rAF does not fire at all while the page is occluded, which is reachable on a CI runner and
+  // stalls the sampler on its first frame. A missed wheel event did the same. Either way the
+  // test hung until its own timeout with nothing to read. A timed sampler with a deadline
+  // cannot: worst case it gives up and the poll below reports what the scroll actually did.
+  const wheelSettled = scroll.evaluate((root: Element, timeoutMs: number) => {
+    const scrollElement = root as HTMLElement;
+    return new Promise<void>((resolve) => {
+      const startedAt = Date.now();
+      let sawWheel = false;
+      let previousOffset = scrollElement.scrollTop;
+      let stableSamples = 0;
+      root.addEventListener(
+        "wheel",
+        () => {
+          sawWheel = true;
+        },
+        { once: true },
+      );
+      const sample = () => {
+        const currentOffset = scrollElement.scrollTop;
+        const isStable = sawWheel && Math.abs(currentOffset - previousOffset) <= 0.5;
+        stableSamples = isStable ? stableSamples + 1 : 0;
+        previousOffset = currentOffset;
+        if (stableSamples >= 3 || Date.now() - startedAt >= timeoutMs) {
+          resolve();
+          return;
+        }
+        setTimeout(sample, 16);
+      };
+      sample();
+    });
+  }, WHEEL_SETTLE_TIMEOUT_MS);
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
   await page.mouse.wheel(0, input.deltaY);
   await wheelSettled;
@@ -168,58 +205,53 @@ export async function clickToolCallBesideScrollToBottomButton(page: Page): Promi
   const visibleButtonBounds = buttonBounds!;
 
   const toolCalls = page.locator('[data-testid="tool-call-badge"] [role="button"]');
-  const toolCallBounds = await Promise.all(
-    Array.from({ length: await toolCalls.count() }, async (_, index) => ({
-      index,
-      bounds: await toolCalls.nth(index).boundingBox(),
-    })),
-  );
   const buttonCenterY = visibleButtonBounds.y + visibleButtonBounds.height / 2;
-  const candidate = toolCallBounds
-    .filter(
-      (entry): entry is { index: number; bounds: NonNullable<typeof entry.bounds> } =>
-        entry.bounds !== null && entry.bounds.width > 0,
-    )
-    .sort(
-      (left, right) =>
-        Math.abs(left.bounds.y + left.bounds.height / 2 - buttonCenterY) -
-        Math.abs(right.bounds.y + right.bounds.height / 2 - buttonCenterY),
-    )[0];
+  const initialToolCalls = await readRenderedToolCalls(toolCalls);
+  const initialCandidate = closestToolCallToY(initialToolCalls, buttonCenterY);
   expect(
-    candidate,
+    initialCandidate,
     `Expected at least one rendered tool-call badge: ${JSON.stringify({
       buttonBounds,
       scrollMetrics: await readScrollMetrics(page),
-      toolCallBounds,
+      toolCallBounds: initialToolCalls.map(({ bounds }) => bounds),
     })}`,
   ).toBeDefined();
-  const visibleToolCall = candidate!;
-  const initialToolCallCenterY = visibleToolCall.bounds.y + visibleToolCall.bounds.height / 2;
-  await getVisibleChatScroll(page).evaluate((scroll, deltaY) => {
-    (scroll as HTMLElement).scrollTop += deltaY;
-  }, initialToolCallCenterY - buttonCenterY);
-
-  const alignedToolCall = toolCalls.nth(visibleToolCall.index);
   await expect
     .poll(async () => {
-      const [currentButtonBounds, currentToolCallBounds] = await Promise.all([
-        scrollToBottomButton.boundingBox(),
-        alignedToolCall.boundingBox(),
-      ]);
-      if (!currentButtonBounds || !currentToolCallBounds) {
-        return false;
-      }
-      const toolCallCenterY = currentToolCallBounds.y + currentToolCallBounds.height / 2;
-      return (
+      const currentButtonBounds = await scrollToBottomButton.boundingBox();
+      if (!currentButtonBounds) return false;
+      const currentButtonCenterY = currentButtonBounds.y + currentButtonBounds.height / 2;
+      const closest = closestToolCallToY(
+        await readRenderedToolCalls(toolCalls),
+        currentButtonCenterY,
+      );
+      if (!closest) return false;
+      const toolCallCenterY = closest.bounds.y + closest.bounds.height / 2;
+      if (
         toolCallCenterY >= currentButtonBounds.y &&
         toolCallCenterY <= currentButtonBounds.y + currentButtonBounds.height
-      );
+      ) {
+        return true;
+      }
+      const deltaY = Math.max(-200, Math.min(200, toolCallCenterY - currentButtonCenterY));
+      await getVisibleChatScroll(page).evaluate((scroll, delta) => {
+        (scroll as HTMLElement).scrollTop += delta;
+      }, deltaY);
+      return false;
     })
     .toBe(true);
 
+  const currentButtonBounds = await scrollToBottomButton.boundingBox();
+  expect(currentButtonBounds, "Expected scroll-to-bottom button to remain visible").not.toBeNull();
+  const currentButtonCenterY = currentButtonBounds!.y + currentButtonBounds!.height / 2;
+  const alignedToolCall = closestToolCallToY(
+    await readRenderedToolCalls(toolCalls),
+    currentButtonCenterY,
+  )?.locator;
+  expect(alignedToolCall, "Expected an aligned tool-call badge").toBeDefined();
   const [alignedButtonBounds, visibleToolCallBounds] = await Promise.all([
     scrollToBottomButton.boundingBox(),
-    alignedToolCall.boundingBox(),
+    alignedToolCall!.boundingBox(),
   ]);
   expect(alignedButtonBounds, "Expected scroll-to-bottom button to remain visible").not.toBeNull();
   expect(
@@ -233,7 +265,7 @@ export async function clickToolCallBesideScrollToBottomButton(page: Page): Promi
     x: finalToolCallBounds.x + 24,
     y: finalToolCallBounds.y + finalToolCallBounds.height / 2,
   };
-  const toolCallReceivesPointer = await alignedToolCall.evaluate((toolCall, point) => {
+  const toolCallReceivesPointer = await alignedToolCall!.evaluate((toolCall, point) => {
     const hit = document.elementFromPoint(point.x, point.y);
     return hit !== null && toolCall.contains(hit);
   }, clickPoint);

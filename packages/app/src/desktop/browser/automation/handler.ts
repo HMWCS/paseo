@@ -5,7 +5,12 @@ import {
   removeResidentBrowserWebview,
   resizeResidentBrowserWebview,
 } from "@/desktop/browser/resident-webviews";
-import { createWorkspaceBrowser, getBrowserRecord, useBrowserStore } from "@/desktop/browser/store";
+import {
+  createFixedBrowserViewport,
+  createWorkspaceBrowser,
+  getBrowserRecord,
+  useBrowserStore,
+} from "@/desktop/browser/store";
 import { collectAllTabs, useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 
@@ -208,6 +213,9 @@ function resizeBrowserTabForRequest(params: {
       message: `No browser tab found for ID: ${browserId}`,
     });
   }
+  useBrowserStore
+    .getState()
+    .setBrowserViewport(browserId, createFixedBrowserViewport(dimensions.width, dimensions.height));
 
   return {
     requestId: request.requestId,
@@ -328,9 +336,10 @@ async function openBrowserTabForRequest(params: {
       message: "Cannot create a browser tab without a workspace context.",
     });
   }
-  useWorkspaceLayoutStore.getState().openTabInBackground(workspaceKey, {
-    kind: "browser",
-    browserId,
+  useWorkspaceLayoutStore.getState().openTab({
+    workspaceKey,
+    target: { kind: "browser", browserId },
+    intent: "background",
   });
 
   if (browserHost?.executeAutomationCommand) {

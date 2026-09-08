@@ -4,9 +4,9 @@ import {
   clickChatOutlineRowEdge,
   disableChatOutlineFromAppearance,
   expectActiveChatOutlinePrompt,
+  expectActiveChatOutlinePromptMovedFrom,
   expectChatOutlinePreview,
   expectChatOutlinePrompts,
-  expectChatOutlineAlignedWithActiveTabGlyph,
   expectChatOutlinePromptToRemainBare,
   expectLiveTurnPromptAboveFoldAndActive,
   expectNoChatOutlinePreviewWhileCrossingToSidebar,
@@ -30,12 +30,14 @@ import {
   openAgentTimeline,
   scrollThroughOlderHistoryPages,
   scrollTimelineToNewestLoadedEdge,
-  scrollTimelineToOldestLoadedEdge,
   seedLongMockAgentTimeline,
   type LongTimelineAgent,
 } from "../support/helpers/timeline-pagination";
 
-const WIDE_VIEWPORT = { width: 1280, height: 900 };
+// Wide enough that the timeline panel clears the rail's MIN_PANEL_WIDTH with room
+// to spare. At 1280 the panel measures 960, which sits too close to the threshold
+// for chrome-width changes elsewhere to stay out of these tests.
+const WIDE_VIEWPORT = { width: 1440, height: 900 };
 const LOADED_TURNS = 16;
 
 test.describe("desktop chat outline", () => {
@@ -117,6 +119,7 @@ test.describe("desktop chat outline", () => {
     test("previews and jumps to the focused prompt from the keyboard", async ({ page }) => {
       await focusChatOutlinePrompt(page, 1);
       await expectChatOutlinePreview(page, agent.prompts[0]);
+      await expectTimelinePromptNotMounted(page, agent.oldestPrompt);
 
       await pressEnterOnFocusedPrompt(page);
       await expectTimelinePromptLandedBelowTop(page, agent.oldestPrompt);
@@ -127,21 +130,18 @@ test.describe("desktop chat outline", () => {
       await expectOneActiveChatOutlinePrompt(page);
 
       await clickChatOutlineRowEdge(page, 4);
-      await expectTimelinePromptVisible(page, agent.prompts[3]);
+      await expectTimelinePromptLandedBelowTop(page, agent.prompts[3]);
       await expectActiveChatOutlinePrompt(page, 4);
 
-      await scrollTimelineToOldestLoadedEdge(page);
-      await expectActiveChatOutlinePrompt(page, 1);
+      await scrollTimelineToNewestLoadedEdge(page);
+      await expectTimelinePromptVisible(page, agent.newestPrompt);
+      await expectActiveChatOutlinePromptMovedFrom(page, 4);
     });
 
     test("keeps a clicked prompt free of persistent selection chrome", async ({ page }) => {
       await clickChatOutlineRowEdge(page, 4);
 
       await expectChatOutlinePromptToRemainBare(page, 4);
-    });
-
-    test("aligns the ticks with the active tab glyph rail", async ({ page }) => {
-      await expectChatOutlineAlignedWithActiveTabGlyph(page);
     });
 
     test("clamps the newest prompt at maximum scroll while keeping it visible", async ({

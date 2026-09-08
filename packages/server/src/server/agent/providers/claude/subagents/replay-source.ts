@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import type { AgentTimelineItem } from "../../../agent-sdk-types.js";
 import { normalizeProviderReplayTimestamp } from "../../../provider-history-timestamps.js";
+import type { ProviderSubagentStatus } from "../../../provider-subagents/store.js";
 import { resolveObservedClaudeModelId } from "../models.js";
 import type { SubagentObservation } from "./observation.js";
 import { buildClaudeSubagentSubtitle, type ClaudeSubagentUsage } from "./presentation.js";
@@ -141,6 +142,8 @@ export interface ClaudeReplaySubagentInput {
   agentId: string;
   meta: ClaudeSubagentMeta | null;
   entries: ClaudeReplayEntry[];
+  /** Task declarations made by this subagent, used to attach its direct children. */
+  parentFacts?: ClaudeReplayParentFacts;
 }
 
 export interface ClaudeReplayParentFacts {
@@ -152,52 +155,83 @@ export interface ClaudeReplayParentFacts {
   outcomesByToolCallId: ReadonlyMap<string, { failed: boolean }>;
 }
 
-interface ResolvedLink {
+interface ParentLink {
   id: string;
-  toolCallId: string | null;
-  failed: boolean | null;
+  toolCallId: string;
+  /** Terminal status recorded by the parent, or null when its Task has no outcome yet. */
+  status: ProviderSubagentStatus | null;
 }
 
 /**
- * Resolve the canonical subagent id.
+ * Resolve a child only when the parent transcript declares the corresponding Task.
  *
- * `meta.toolUseId` is authoritative: it is the same id the live stream keys on. The legacy path
- * scrapes `agentId:` out of stringified tool-result content, which both misses the link when the
- * parent's tool_result is absent and matches unrelated text — on a real five-subagent session it
- * produced eight ids, inventing `z`, `string`, and `update`. It stays only as a fallback for
- * sessions recorded before the meta file existed.
+ * `meta.toolUseId` is authoritative for identity — it is the same id the live stream keys on. The
+ * legacy path scrapes `agentId:` out of stringified tool-result content, which both misses the link
+ * when the parent's tool_result is absent and matches unrelated text — on a real five-subagent
+ * session it produced eight ids, inventing `z`, `string`, and `update`. It stays only as a fallback
+ * for sessions recorded before the meta file existed.
+ *
+ * ```
+ * meta.toolUseId matches a parent Task?
+ * ├─ yes → use it and the parent's outcome, when present
+ * └─ no  → a legacy scraped agentId link matches a parent Task?
+ *           ├─ yes → use it and its recorded outcome
+ *           └─ no  → drop it; live never declared this child either
+ * ```
+ *
+ * Claude writes grandchildren and skill-owned sidechains beside direct children. Admitting those
+ * without a parent Task creates replay-only rows with no identity or lifecycle source. Filtering
+ * here keeps live and replay on the same declaration boundary.
  */
-function resolveLink(
+function resolveParentLink(
   subagent: ClaudeReplaySubagentInput,
   parent: ClaudeReplayParentFacts,
-): ResolvedLink {
+): ParentLink | null {
   const metaToolUseId = subagent.meta?.toolUseId?.trim();
-  if (metaToolUseId) {
+  if (metaToolUseId && parent.toolCalls.has(metaToolUseId)) {
     const outcome = parent.outcomesByToolCallId.get(metaToolUseId);
+    let status: ProviderSubagentStatus | null = null;
+    if (outcome) status = outcome.failed ? "failed" : "completed";
     return {
       id: metaToolUseId,
       toolCallId: metaToolUseId,
-      failed: outcome ? outcome.failed : null,
+      status,
     };
   }
 
   const scraped = parent.linksByAgentId.get(subagent.agentId);
-  if (scraped) {
-    return { id: scraped.toolCallId, toolCallId: scraped.toolCallId, failed: scraped.failed };
+  if (scraped && parent.toolCalls.has(scraped.toolCallId)) {
+    return {
+      id: scraped.toolCallId,
+      toolCallId: scraped.toolCallId,
+      status: scraped.failed ? "failed" : "completed",
+    };
   }
 
-  // No link at all: keep the subagent visible under its own agent id rather than dropping it.
-  return { id: subagent.agentId, toolCallId: null, failed: null };
+  return null;
+}
+
+/** A final `end_turn` is the child's own completion signal when the parent result is absent. */
+function readChildTerminalStatus(
+  entries: readonly ClaudeReplayEntry[],
+): ProviderSubagentStatus | null {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry?.type !== "assistant") continue;
+    return entry.message?.stop_reason === "end_turn" ? "completed" : null;
+  }
+  return null;
 }
 
 /**
- * The parent's tool input is the same source the live path reads, so it wins; meta.json fills the
- * gap when the parent's Task call is missing from the transcript.
+ * The parent's tool input is the same identity source the live path reads; meta.json contributes
+ * provider details only after that declaration has admitted the child.
  */
 function declareSubagent(
   subagent: ClaudeReplaySubagentInput,
-  link: ResolvedLink,
+  link: ParentLink,
   toolCall: { title?: string; description?: string } | undefined,
+  parentSubagentId?: string,
 ): SubagentObservation {
   const title = toolCall?.title ?? subagent.meta?.agentType;
   const description = toolCall?.description ?? subagent.meta?.description;
@@ -208,13 +242,14 @@ function declareSubagent(
     ...(title ? { title } : {}),
     ...(description ? { description } : {}),
     ...(link.toolCallId ? { toolCallId: link.toolCallId } : {}),
+    ...(parentSubagentId ? { parentSubagentId } : {}),
     ...(firstTimestamp ? { timestamp: firstTimestamp } : {}),
   };
 }
 
 function observeSubtitle(
   subagent: ClaudeReplaySubagentInput,
-  link: ResolvedLink,
+  link: ParentLink,
   title: string | undefined,
 ): SubagentObservation | null {
   const runtime = readRuntime(subagent.entries);
@@ -243,11 +278,15 @@ function observeSubagent(
   subagent: ClaudeReplaySubagentInput,
   parent: ClaudeReplayParentFacts,
   convertEntry: (entry: ClaudeReplayEntry) => AgentTimelineItem[],
+  parentSubagentId?: string,
 ): SubagentObservation[] {
-  const link = resolveLink(subagent, parent);
-  const toolCall = link.toolCallId ? parent.toolCalls.get(link.toolCallId) : undefined;
+  const link = resolveParentLink(subagent, parent);
+  if (!link) return [];
+  const toolCall = parent.toolCalls.get(link.toolCallId);
 
-  const observations: SubagentObservation[] = [declareSubagent(subagent, link, toolCall)];
+  const observations: SubagentObservation[] = [
+    declareSubagent(subagent, link, toolCall, parentSubagentId),
+  ];
   const subtitle = observeSubtitle(subagent, link, toolCall?.title ?? subagent.meta?.agentType);
   if (subtitle) observations.push(subtitle);
 
@@ -263,14 +302,15 @@ function observeSubagent(
     }
   }
 
-  // A transcript with no recorded outcome is a subagent that never finished — leave it running
-  // rather than inventing a completion.
-  if (link.failed !== null) {
+  // Prefer the parent's result because it carries failure. If that result is missing, the child's
+  // final end_turn still proves completion. Any other shape remains running.
+  const terminalStatus = link.status ?? readChildTerminalStatus(subagent.entries);
+  if (terminalStatus) {
     const lastTimestamp = normalizeProviderReplayTimestamp(subagent.entries.at(-1)?.timestamp);
     observations.push({
       kind: "status",
       id: link.id,
-      status: link.failed ? "failed" : "completed",
+      status: terminalStatus,
       ...(lastTimestamp ? { timestamp: lastTimestamp } : {}),
     });
   }
@@ -278,35 +318,72 @@ function observeSubagent(
   return observations;
 }
 
-/**
- * Whether this transcript belongs to a child of the session being replayed.
- *
- * Claude Code writes every descendant into the same `subagents/` directory, not just the session's
- * own children, and `spawnDepth` is what separates them: 1 is a direct child, 2+ was spawned by
- * another subagent. A grandchild's `toolUseId` names a Task call made inside its parent's session,
- * so nothing in this transcript can resolve it — surveyed across recorded sessions, every depth-1
- * id matched a Task tool_use block in the parent transcript and no deeper id did. Replaying them
- * anyway adds rows the live stream never showed, each with no Task card and no recoverable
- * outcome, which leaves them running forever. One session recorded 10 subagents live and would
- * replay 22.
- *
- * Absent depth means a session recorded before the field existed: keep the subagent rather than
- * lose it, matching how every other missing field here is treated.
- */
-function isDirectChild(subagent: ClaudeReplaySubagentInput): boolean {
-  const depth = subagent.meta?.spawnDepth;
-  return depth === undefined || depth <= 1;
+function recordReplayToolOwners(
+  owners: Map<string, string>,
+  entries: readonly ClaudeReplayEntry[],
+  subagentId: string,
+): void {
+  for (const entry of entries) {
+    if (entry.type !== "assistant" || !Array.isArray(entry.message?.content)) continue;
+    for (const block of entry.message.content) {
+      if (block?.type === "tool_use" && typeof block.id === "string") {
+        owners.set(block.id, subagentId);
+      }
+    }
+  }
 }
 
 export function observeReplaySubagents(input: {
   subagents: readonly ClaudeReplaySubagentInput[];
   parent: ClaudeReplayParentFacts;
   convertEntry: (entry: ClaudeReplayEntry) => AgentTimelineItem[];
-}): SubagentObservation[] {
+}): { observations: SubagentObservation[]; toolOwners: ReadonlyMap<string, string> } {
   const observations: SubagentObservation[] = [];
-  for (const subagent of input.subagents) {
-    if (!isDirectChild(subagent)) continue;
-    observations.push(...observeSubagent(subagent, input.parent, input.convertEntry));
+  const toolOwners = new Map<string, string>();
+  const unresolved = [...input.subagents].sort(
+    (left, right) => (left.meta?.spawnDepth ?? 1) - (right.meta?.spawnDepth ?? 1),
+  );
+  const resolvedParents = new Map<string, ClaudeReplayParentFacts>();
+
+  // Claude stores every descendant beside the root transcript. Resolve one generation at a
+  // time: a child is admitted only when its tool id is declared by a transcript whose own parent
+  // has already been proven. This preserves the old boundary against unrelated ambient sidecars.
+  let madeProgress = true;
+  while (unresolved.length > 0 && madeProgress) {
+    madeProgress = false;
+    for (let index = unresolved.length - 1; index >= 0; index--) {
+      const subagent = unresolved[index];
+      if (!subagent) continue;
+      const resolved = resolveReplayOwner(subagent, input.parent, resolvedParents);
+      if (!resolved) continue;
+      const { ownerId, parent, link } = resolved;
+
+      // Only proven descendants may own notifications; ambient sidecars cannot claim them.
+      recordReplayToolOwners(toolOwners, subagent.entries, link.id);
+      observations.push(...observeSubagent(subagent, parent, input.convertEntry, ownerId));
+      if (subagent.parentFacts) resolvedParents.set(link.id, subagent.parentFacts);
+      unresolved.splice(index, 1);
+      madeProgress = true;
+    }
   }
-  return observations;
+  return { observations, toolOwners };
+}
+
+function resolveReplayOwner(
+  subagent: ClaudeReplaySubagentInput,
+  rootParent: ClaudeReplayParentFacts,
+  resolvedParents: ReadonlyMap<string, ClaudeReplayParentFacts>,
+): {
+  ownerId?: string;
+  parent: ClaudeReplayParentFacts;
+  link: NonNullable<ReturnType<typeof resolveParentLink>>;
+} | null {
+  const rootLink = resolveParentLink(subagent, rootParent);
+  if (rootLink) return { parent: rootParent, link: rootLink };
+
+  for (const [ownerId, parent] of resolvedParents) {
+    const link = resolveParentLink(subagent, parent);
+    if (link) return { ownerId, parent, link };
+  }
+  return null;
 }

@@ -8,6 +8,7 @@ import type {
 } from "../../messages.js";
 import type { ManagedAgent } from "../../agent/agent-manager.js";
 import type { StoredAgentRecord } from "../../agent/agent-storage.js";
+import { DirectorySyncService } from "../../directory-sync/index.js";
 
 // No mocks — every dependency is an injected in-memory fake. The agent payloads
 // are supplied through the fake builders, so each test fully controls the
@@ -99,10 +100,15 @@ function buildHarness() {
   const projectByWorkspaceId = new Map<string, ProjectPlacementPayload | null>();
   let providerVisible: (provider: string) => boolean = () => true;
   let buildAgentPayloadError: Error | null = null;
+  let enrichProjectedPayload = false;
+  const directorySync = new DirectorySyncService("test-generation");
 
   const service = createAgentUpdatesService({
     emit: (message) => emitted.push(message),
     enrichAgentPayload: async (payload) => {
+      if (enrichProjectedPayload) {
+        return payload;
+      }
       const queuedPayload = queuedPayloadBuilds.shift();
       if (queuedPayload) {
         return queuedPayload;
@@ -129,6 +135,13 @@ function buildHarness() {
     emitWorkspaceUpdateForWorkspaceId: async (workspaceId) => {
       workspaceUpdates.push(workspaceId);
     },
+    sequenceAgentUpdate: (payload, agent, project, agentId, includeSequence) =>
+      directorySync.sequenceAgentUpdate(
+        payload,
+        agent && project ? { agent, project } : null,
+        agentId,
+        includeSequence,
+      ),
     logger: { error: (...args: unknown[]) => loggedErrors.push(args) } as unknown as pino.Logger,
   });
 
@@ -151,6 +164,9 @@ function buildHarness() {
     },
     setProviderVisible(fn: (provider: string) => boolean) {
       providerVisible = fn;
+    },
+    useProjectedPayload() {
+      enrichProjectedPayload = true;
     },
     failBuildAgentPayload(error: Error) {
       buildAgentPayloadError = error;
@@ -327,6 +343,56 @@ describe("forwardLiveAgent", () => {
       { kind: "upsert", agent: expect.objectContaining({ id: "a" }), project: makeProject() },
     ]);
     expect(h.workspaceUpdates).toEqual(["ws-1"]);
+  });
+
+  test("never projects MCP credentials into ordinary client updates", async () => {
+    const h = buildHarness();
+    h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
+    h.service.flushBootstrapped("sub");
+    h.register(makeAgentPayload({ id: "a", workspaceId: "ws-1" }));
+    h.useProjectedPayload();
+    const agent = h.managed("a");
+    agent.config.mcpServers = {
+      hub: {
+        type: "http",
+        url: "https://hub.test/mcp/executions/execution-1",
+        headers: { Authorization: "Bearer execution-secret" },
+      },
+    };
+    agent.persistence = {
+      provider: "codex",
+      sessionId: "session-a",
+      metadata: {
+        conversationId: "conversation-a",
+        mcpServers: agent.config.mcpServers,
+      },
+    };
+    expect(agent.config).toMatchObject({
+      provider: "codex",
+      mcpServers: {
+        hub: {
+          type: "http",
+          url: "https://hub.test/mcp/executions/execution-1",
+          headers: { Authorization: "Bearer execution-secret" },
+        },
+      },
+    });
+
+    await h.service.forwardLiveAgent(agent);
+
+    const update = h.agentUpdates()[0];
+    expect(update).toEqual({
+      kind: "upsert",
+      agent: expect.objectContaining({ id: "a" }),
+      project: makeProject(),
+    });
+    if (update?.kind !== "upsert") {
+      throw new Error("Expected an agent upsert");
+    }
+    expect(update.agent).not.toHaveProperty("config");
+    expect(update.agent).not.toHaveProperty("mcpServers");
+    expect(update.agent.persistence?.metadata).toEqual({ conversationId: "conversation-a" });
+    expect(JSON.stringify(update.agent)).not.toContain("execution-secret");
   });
 
   test("emits a remove when the agent's workspace resolves to no project", async () => {
@@ -551,6 +617,21 @@ describe("bootstrap buffering", () => {
 });
 
 describe("subscription lifecycle", () => {
+  test("attention eligibility follows the active directory subscription filter", async () => {
+    const h = buildHarness();
+    h.register(makeAgentPayload({ id: "matching", workspaceId: "ws-1", labels: { team: "a" } }));
+    h.register(makeAgentPayload({ id: "excluded", workspaceId: "ws-2", labels: { team: "b" } }));
+
+    expect(await h.service.includesLiveAgent(h.managed("matching"))).toBe(false);
+
+    h.service.beginSubscription({ subscriptionId: "sub", filter: { labels: { team: "a" } } });
+    expect(await h.service.includesLiveAgent(h.managed("matching"))).toBe(true);
+    expect(await h.service.includesLiveAgent(h.managed("excluded"))).toBe(false);
+
+    h.service.clearSubscription("sub");
+    expect(await h.service.includesLiveAgent(h.managed("matching"))).toBe(false);
+  });
+
   test("flushBootstrapped is a no-op for a stale subscription id", async () => {
     const h = buildHarness();
     h.service.beginSubscription({ subscriptionId: "sub", filter: {} });
@@ -599,4 +680,14 @@ describe("subscription lifecycle", () => {
 
     expect(h.agentUpdates()).toEqual([{ kind: "remove", agentId: "a" }]);
   });
+});
+
+test("an idle session skips agent hydration while preserving workspace updates", async () => {
+  const h = buildHarness();
+  const agent = { ...h.managed("unobserved"), workspaceId: "workspace" };
+  // No payload is registered: attempting to hydrate this agent would fail.
+  await h.service.forwardLiveAgent(agent);
+  expect(h.loggedErrors).toEqual([]);
+  expect(h.agentUpdates()).toEqual([]);
+  expect(h.workspaceUpdates).toEqual([agent.workspaceId]);
 });

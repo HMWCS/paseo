@@ -50,10 +50,12 @@ The image runs the daemon and serves the bundled web UI. It does not bundle agen
 
 ## Where next
 
+- [Connectivity](/docs/connectivity), connect through the relay or Tailscale.
 - [Docker](/docs/docker), run the daemon and bundled web UI in a container.
 - [Workspaces](/docs/workspaces), the project, workspace, and session model Paseo is built around.
 - [Providers](/docs/providers), what a provider is and how Paseo wraps existing CLIs.
 - [Orchestration](/docs/orchestration), let one agent delegate work to other providers and models.
+- [Plugins](/docs/plugins), add trusted local surfaces, sidebar actions, daemon behavior, and composer attachments.
 - [CLI reference](/docs/cli), every command.
 - [Self-hosting the web UI](/docs/web-ui), serve the browser app from your own daemon.
 - [GitHub repo](https://github.com/getpaseo/paseo)

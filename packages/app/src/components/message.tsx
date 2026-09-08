@@ -1,4 +1,5 @@
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { TaskListRow } from "@/components/task-list-row";
 import {
   View,
   Text,
@@ -23,24 +24,20 @@ import {
   useCallback,
   createContext,
   useContext,
-  isValidElement,
-  Children,
-  cloneElement,
 } from "react";
 import type { ComponentType, ReactNode } from "react";
-import { MarkdownIt, type ASTNode, type RenderRules } from "react-native-markdown-display";
+import type MarkdownIt from "markdown-it";
+import { type ASTNode, type RenderRules } from "react-native-markdown-display";
 import MaskedView from "@react-native-masked-view/masked-view";
 import {
-  Circle,
   Info,
-  CheckCircle,
   XCircle,
-  FileText,
   ChevronRight,
-  ChevronDown,
   Check,
   CheckSquare,
+  CircleDot,
   Copy,
+  Plus,
   TriangleAlertIcon,
   Scissors,
   MicVocal,
@@ -58,10 +55,9 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import Svg, { Defs, LinearGradient as SvgLinearGradient, Rect, Stop } from "react-native-svg";
-import { CODE_SURFACE_DATASET } from "@/styles/code-surface";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { MarkdownRenderer, type MarkdownStyles } from "@/components/markdown/renderer";
-import type { TodoEntry, UserMessageImageAttachment } from "@/types/stream";
+import type { TaskActivity, TodoEntry, UserMessageImageAttachment } from "@/types/stream";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
 import type { ToolCallDetail } from "@getpaseo/protocol/agent-types";
 import { buildToolCallPresentation } from "@/tool-calls/presentation";
@@ -70,11 +66,17 @@ import { getMarkdownListMarker, getMarkdownListSpacing } from "@/utils/markdown-
 import { markdownNodeContainsType } from "@/utils/markdown-ast";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { HighlightedCodeBlock } from "@/components/highlighted-code-block";
+import { MarkdownFenceBlock } from "@/components/markdown/fence";
+import type { MarkdownPhase } from "@/components/markdown/fence/types";
 import { splitMarkdownBlocks } from "@/utils/split-markdown-blocks";
+import { useRevealedText } from "@/hooks/use-revealed-text";
+import { colorMarkdownLinkChildren } from "@/components/markdown/link-children";
+import { createAssistantMarkdownParser } from "@/utils/assistant-markdown-parser";
 import { formatDuration, formatMessageTimestamp } from "@/utils/time";
 import { writeMarkdownToRichClipboard } from "@/utils/rich-clipboard";
 import { getDefaultMarkdownClipboardEnvironment } from "@/utils/rich-clipboard-default-environment";
 import { setAssistantMarkdownBlockHeight } from "@/utils/assistant-message-height-estimate";
+import { isRenderProfileEnabled } from "@/utils/render-profiler";
 import { getAgentAttachmentPillContent } from "@/attachments/attachment-pill-content";
 import { PlanCard } from "./plan-card";
 import { useToolCallSheet } from "./tool-call-sheet";
@@ -95,7 +97,7 @@ import {
   AttachmentLabel,
   AttachmentThumbnail,
 } from "@/components/attachment-pill";
-import { AttachmentLightbox } from "@/components/attachment-lightbox";
+import { AttachmentLightbox, type ImageLightboxSource } from "@/components/attachment-lightbox";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { isWeb, isNative } from "@/constants/platform";
 import type { AgentCapabilityFlags } from "@getpaseo/protocol/agent-types";
@@ -103,6 +105,13 @@ import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
 import { useRewindAgentMutation } from "@/components/rewind/use-rewind-agent-mutation";
 import { AssistantForkMenu, type AssistantForkTarget } from "@/components/assistant-fork-menu";
 import { useRetainedPanelActive } from "@/components/retained-panel";
+import {
+  markdownCopyDataSet,
+  markdownCopyOrderedListDataSet,
+  markdownCopyTableCellDataSet,
+  type MarkdownCopyInlineTag,
+} from "@/assistant-selection-copy/markup";
+import { capAssistantMessageForRender, getUtf8ByteLength } from "./assistant-message-render-limit";
 export type { InlinePathTarget } from "@/assistant-file-links";
 export type { AssistantForkTarget };
 
@@ -155,11 +164,13 @@ const MARKDOWN_ALLOWED_IMAGE_HANDLERS = [
 const MARKDOWN_TOP_LEVEL_MAX_EXCEEDED_ITEM = <Text key="dotdotdot">...</Text>;
 
 const ThemedMicVocal = withUnistyles(MicVocal);
-const ThemedTodoCheckIcon = withUnistyles(Check);
 const ThemedFileSymlinkIcon = withUnistyles(FileSymlink);
 const ThemedTriangleAlertIcon = withUnistyles(TriangleAlertIcon);
 const ThemedChevronRightIcon = withUnistyles(ChevronRight);
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
+const ThemedNotificationInfo = withUnistyles(Info);
+const ThemedNotificationWarning = withUnistyles(TriangleAlertIcon);
+const ThemedNotificationError = withUnistyles(XCircle);
 
 const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foreground });
 const foregroundMutedColorMapping = (theme: Theme) => ({
@@ -168,10 +179,9 @@ const foregroundMutedColorMapping = (theme: Theme) => ({
 const mutedForegroundColorMapping = (theme: Theme) => ({
   color: theme.colors.mutedForeground,
 });
-const primaryForegroundColorMapping = (theme: Theme) => ({
-  color: theme.colors.primaryForeground,
-});
 const destructiveColorMapping = (theme: Theme) => ({ color: theme.colors.destructive });
+const infoColorMapping = (theme: Theme) => ({ color: theme.colors.palette.blue[300] });
+const warningColorMapping = (theme: Theme) => ({ color: theme.colors.palette.amber[500] });
 const WEB_TOOLCALL_SHIMMER_KEYFRAME_CSS = `
   @keyframes ${WEB_TOOLCALL_SHIMMER_ANIMATION_NAME} {
     0% {
@@ -186,7 +196,7 @@ let webToolCallShimmerRegistered = false;
 const SCROLL_EDGE_EPSILON = 0.5;
 
 // Font size for stream metadata (timestamps, durations, live elapsed timer).
-// Lives between theme.fontSize.xs (12) and theme.fontSize.sm (14); no token.
+// Lives between theme.fontSize.sm (12) and theme.fontSize.base (14); no token.
 export const STREAM_METADATA_FONT_SIZE = 13;
 type ScrollAxis = "x" | "y";
 
@@ -346,8 +356,13 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
   },
   text: {
     color: theme.colors.foreground,
-    fontSize: theme.fontSize.base,
-    ...(isWeb ? { lineHeight: 22, overflowWrap: "anywhere" as const } : {}),
+    fontSize: theme.fontSize.content,
+    ...(isWeb
+      ? {
+          lineHeight: Math.round(theme.fontSize.content * 1.4),
+          overflowWrap: "anywhere" as const,
+        }
+      : {}),
   },
   imagePreviewContainer: {
     flexDirection: "row",
@@ -426,6 +441,10 @@ export const UserMessage = memo(function UserMessage({
   const [isHovered, setIsHovered] = useState(false);
   const [lightboxMetadata, setLightboxMetadata] = useState<UserMessageImageAttachment | null>(null);
   const handleLightboxClose = useCallback(() => setLightboxMetadata(null), []);
+  const lightboxSource = useMemo<ImageLightboxSource | null>(
+    () => (lightboxMetadata ? { type: "attachment", metadata: lightboxMetadata } : null),
+    [lightboxMetadata],
+  );
   const resolvedDisableOuterSpacing = useDisableOuterSpacing(disableOuterSpacing);
   const hasText = message.trim().length > 0;
   const hasImages = images.length > 0;
@@ -551,7 +570,7 @@ export const UserMessage = memo(function UserMessage({
           </View>
         ) : null}
       </View>
-      <AttachmentLightbox metadata={lightboxMetadata} onClose={handleLightboxClose} />
+      <AttachmentLightbox source={lightboxSource} onClose={handleLightboxClose} />
     </View>
   );
 });
@@ -559,7 +578,7 @@ export const UserMessage = memo(function UserMessage({
 interface AssistantTurnFooterProps {
   getContent: () => string;
   completedAt?: Date;
-  durationMs?: number;
+  durationMs?: number | null;
   onFork?: (target: AssistantForkTarget) => Promise<void> | void;
 }
 
@@ -597,9 +616,8 @@ const TIMESTAMP_REVEAL_MS = 3000;
 
 /**
  * Footer rendered next to the copy button at the end of an assistant turn.
- * Always shows the turn duration; swaps to the end timestamp on hover (web)
- * or tap (native). The hidden sizer keeps the label width stable while the
- * visible text swaps.
+ * Shows the turn duration and swaps to the end timestamp when both are known.
+ * A turn without a visible start shows its end timestamp directly.
  */
 export const AssistantTurnFooter = memo(function AssistantTurnFooter({
   getContent,
@@ -621,7 +639,10 @@ export const AssistantTurnFooter = memo(function AssistantTurnFooter({
   }, []);
 
   const durationLabel = useMemo(
-    () => (durationMs !== undefined ? `Worked for ${formatDuration(durationMs)}` : ""),
+    () =>
+      durationMs !== undefined && durationMs !== null
+        ? `Worked for ${formatDuration(durationMs)}`
+        : "",
     [durationMs],
   );
   const timestampLabel = useMemo(
@@ -629,7 +650,8 @@ export const AssistantTurnFooter = memo(function AssistantTurnFooter({
     [completedAt],
   );
 
-  const canSwap = Boolean(timestampLabel);
+  const primaryLabel = durationLabel || timestampLabel;
+  const canSwap = Boolean(durationLabel && timestampLabel);
   const showTimestamp = canSwap && (isWeb ? hovered : pressedReveal);
 
   const handleHoverIn = useCallback(() => setHovered(true), []);
@@ -660,22 +682,22 @@ export const AssistantTurnFooter = memo(function AssistantTurnFooter({
         containerStyle={assistantTurnFooterStylesheet.copyButton}
       />
       {canFork ? <AssistantForkMenu onFork={handleFork} /> : null}
-      {durationLabel ? (
+      {primaryLabel ? (
         <Pressable
           onPress={handlePress}
           onHoverIn={handleHoverIn}
           onHoverOut={handleHoverOut}
           accessibilityRole={canSwap ? "button" : undefined}
-          accessibilityLabel={canSwap ? `${durationLabel}, ended ${timestampLabel}` : durationLabel}
+          accessibilityLabel={canSwap ? `${durationLabel}, ended ${timestampLabel}` : primaryLabel}
         >
           <View style={assistantTurnFooterStylesheet.labelWrapper}>
             {/* Sizer reserves space for whichever label is longer so the
                 container width is stable across hover transitions. */}
             <Text style={assistantTurnFooterStylesheet.labelSizer} aria-hidden>
-              {durationLabel.length >= timestampLabel.length ? durationLabel : timestampLabel}
+              {primaryLabel.length >= timestampLabel.length ? primaryLabel : timestampLabel}
             </Text>
             <Text style={assistantTurnFooterStylesheet.labelOverlay}>
-              {showTimestamp ? timestampLabel : durationLabel}
+              {showTimestamp ? timestampLabel : primaryLabel}
             </Text>
           </View>
         </Pressable>
@@ -731,6 +753,7 @@ interface AssistantMessageProps {
   serverId?: string;
   client?: DaemonClient | null;
   spacing?: "default" | "compactTop" | "compactBottom" | "compactBoth";
+  phase: MarkdownPhase;
 }
 
 export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
@@ -743,6 +766,13 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   },
   containerCompactBottom: {
     paddingBottom: 0,
+  },
+  cappedNotice: {
+    marginTop: theme.spacing[3],
+    fontFamily: theme.fontFamily.ui,
+    fontSize: theme.fontSize.base,
+    fontStyle: "italic",
+    color: theme.colors.foregroundMuted,
   },
   imageFrame: {
     width: "100%",
@@ -776,7 +806,7 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   },
   imageErrorText: {
     color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
+    fontSize: theme.fontSize.base,
     textAlign: "center",
   },
 }));
@@ -800,6 +830,10 @@ function AssistantMarkdownImage({
   workspaceRoot?: string;
   serverId?: string;
 }) {
+  const { t } = useTranslation();
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const openViewer = useCallback(() => setViewerOpen(true), []);
+  const closeViewer = useCallback(() => setViewerOpen(false), []);
   const containerStyle = useMemo<StyleProp<ViewStyle>>(
     () => ({
       marginTop: hasLeadingContent ? 16 : 0,
@@ -832,6 +866,14 @@ function AssistantMarkdownImage({
     () => [assistantMessageStylesheet.imageSurface, imageSizeStyle],
     [imageSizeStyle],
   );
+  const lightboxSource = useMemo<ImageLightboxSource | null>(() => {
+    if (!viewerOpen || !imageUri) return null;
+    return {
+      type: "uri",
+      uri: imageUri,
+      contentSize: aspectRatio ? { width: aspectRatio, height: 1 } : undefined,
+    };
+  }, [aspectRatio, imageUri, viewerOpen]);
 
   const stateFrameStyle = useMemo<StyleProp<ViewStyle>>(
     () => [
@@ -861,29 +903,39 @@ function AssistantMarkdownImage({
 
   return (
     <View style={frameStyle}>
-      <View style={surfaceStyle} accessibilityRole="image" accessibilityLabel={alt}>
-        <Image
-          ref={binding.onRef}
-          source={imageSource}
+      <Pressable
+        accessibilityLabel={t("composer.attachments.openImage")}
+        accessibilityRole="button"
+        disabled={image.status !== "loaded"}
+        onPress={openViewer}
+        style={surfaceStyle}
+      >
+        <View
           style={assistantMessageStylesheet.image}
-          resizeMode="contain"
-          onLoad={binding.onLoad}
-          onError={binding.onError}
-        />
-        {image.status === "loading" ? (
-          <View pointerEvents="none" style={assistantMessageStylesheet.imageLoadingOverlay}>
-            <ThemedLoadingSpinner size="small" uniProps={foregroundMutedColorMapping} />
-          </View>
-        ) : null}
-      </View>
+          accessibilityRole="image"
+          accessibilityLabel={alt}
+        >
+          <Image
+            ref={binding.onRef}
+            source={imageSource}
+            style={assistantMessageStylesheet.image}
+            resizeMode="contain"
+            onLoad={binding.onLoad}
+            onError={binding.onError}
+          />
+          {image.status === "loading" ? (
+            <View pointerEvents="none" style={assistantMessageStylesheet.imageLoadingOverlay}>
+              <ThemedLoadingSpinner size="small" uniProps={foregroundMutedColorMapping} />
+            </View>
+          ) : null}
+        </View>
+      </Pressable>
+      <AttachmentLightbox source={lightboxSource} onClose={closeViewer} />
     </View>
   );
 }
 
-function getInlineCodeAutoLinkUrl(
-  markdownParser: ReturnType<typeof MarkdownIt>,
-  content: string,
-): string | null {
+function getInlineCodeAutoLinkUrl(markdownParser: MarkdownIt, content: string): string | null {
   const trimmed = content.trim();
   if (!trimmed) {
     return null;
@@ -928,6 +980,7 @@ function getMarkdownLinkSource(node: AssistantMarkdownAstNode): AssistantFileLin
   return {
     href: typeof node.attributes?.href === "string" ? node.attributes.href : "",
     text: getMarkdownNodeText(node),
+    title: typeof node.attributes?.title === "string" ? node.attributes.title : undefined,
     markup: node.markup,
     sourceInfo: node.sourceInfo,
     sourceType: node.sourceType === "inline-code" ? "inline-code" : undefined,
@@ -1364,6 +1417,7 @@ interface MarkdownInheritedTextProps {
   textStyle: TextStyle;
   style?: StyleProp<TextStyle>;
   monoSurface?: boolean;
+  copyTag?: MarkdownCopyInlineTag;
   children: ReactNode;
 }
 
@@ -1372,6 +1426,7 @@ function MarkdownInheritedText({
   textStyle,
   style: overrideStyle,
   monoSurface,
+  copyTag,
   children,
 }: MarkdownInheritedTextProps) {
   const style = useMemo(
@@ -1387,6 +1442,7 @@ function MarkdownInheritedText({
   return (
     <MarkdownTextSpan
       monoSurface={monoSurface}
+      copyTag={copyTag}
       style={style}
       onPress={linkPress?.onPress}
       accessibilityRole={linkPress?.accessibilityRole}
@@ -1410,13 +1466,27 @@ function MarkdownListItemContent({ contentStyle, children }: MarkdownListItemCon
 
 interface MarkdownListViewProps {
   baseStyle: ViewStyle;
+  copyTag: "ol" | "ul";
+  orderedStart?: unknown;
   spacing: { marginTop: number; marginBottom: number };
   children: ReactNode;
 }
 
-function MarkdownListView({ baseStyle, spacing, children }: MarkdownListViewProps) {
+function MarkdownListView({
+  baseStyle,
+  copyTag,
+  orderedStart,
+  spacing,
+  children,
+}: MarkdownListViewProps) {
   const style = useMemo(() => [baseStyle, spacing], [baseStyle, spacing]);
-  return <View style={style}>{children}</View>;
+  const copyDataSet =
+    copyTag === "ol" ? markdownCopyOrderedListDataSet(orderedStart) : markdownCopyDataSet.ul;
+  return (
+    <View style={style} dataSet={copyDataSet}>
+      {children}
+    </View>
+  );
 }
 
 export const AssistantMessage = memo(function AssistantMessage({
@@ -1427,23 +1497,22 @@ export const AssistantMessage = memo(function AssistantMessage({
   serverId,
   client,
   spacing = "default",
+  phase,
 }: AssistantMessageProps) {
-  const markdownParser = useMemo(() => {
-    const parser = MarkdownIt({ typographer: true, linkify: true });
-    const defaultValidateLink = parser.validateLink.bind(parser);
-    parser.validateLink = (url: string) => {
-      if (url.trim().toLowerCase().startsWith("file://")) {
-        return true;
-      }
-
-      return defaultValidateLink(url);
-    };
-    return parser;
-  }, []);
+  const { t } = useTranslation();
+  const markdownParser = useMemo(createAssistantMarkdownParser, []);
+  const renderedMessage = useMemo(() => capAssistantMessageForRender(message), [message]);
+  // Paint a paced prefix while the turn is streaming so text arrives at a steady
+  // rate instead of in whatever lumps the daemon's coalescing window produced.
+  const revealedMessage = useRevealedText(renderedMessage.text, phase);
+  const fullMessageByteLength = useMemo(
+    () => (renderedMessage.capped && phase === "complete" ? getUtf8ByteLength(message) : null),
+    [message, phase, renderedMessage.capped],
+  );
 
   const fileLinkActions = useAssistantFileLinkActions();
   const handleMarkdownLinkPress = useStableEvent((url: string) => {
-    fileLinkActions.open({ href: url }, "main");
+    fileLinkActions.open({ href: url }, "preferred");
     // react-native-markdown-display opens the link itself when this returns true.
     // We already handled it above, so return false to avoid duplicate opens.
     return false;
@@ -1451,6 +1520,103 @@ export const AssistantMessage = memo(function AssistantMessage({
 
   const markdownRules = useMemo<RenderRules>(() => {
     return {
+      heading1: (
+        node: ASTNode,
+        children: ReactNode[],
+        _parent: ASTNode[],
+        styles: MarkdownStyles,
+      ) => (
+        <View key={node.key} style={styles._VIEW_SAFE_heading1} dataSet={markdownCopyDataSet.h1}>
+          {children}
+        </View>
+      ),
+      heading2: (
+        node: ASTNode,
+        children: ReactNode[],
+        _parent: ASTNode[],
+        styles: MarkdownStyles,
+      ) => (
+        <View key={node.key} style={styles._VIEW_SAFE_heading2} dataSet={markdownCopyDataSet.h2}>
+          {children}
+        </View>
+      ),
+      heading3: (
+        node: ASTNode,
+        children: ReactNode[],
+        _parent: ASTNode[],
+        styles: MarkdownStyles,
+      ) => (
+        <View key={node.key} style={styles._VIEW_SAFE_heading3} dataSet={markdownCopyDataSet.h3}>
+          {children}
+        </View>
+      ),
+      heading4: (
+        node: ASTNode,
+        children: ReactNode[],
+        _parent: ASTNode[],
+        styles: MarkdownStyles,
+      ) => (
+        <View key={node.key} style={styles._VIEW_SAFE_heading4} dataSet={markdownCopyDataSet.h4}>
+          {children}
+        </View>
+      ),
+      heading5: (
+        node: ASTNode,
+        children: ReactNode[],
+        _parent: ASTNode[],
+        styles: MarkdownStyles,
+      ) => (
+        <View key={node.key} style={styles._VIEW_SAFE_heading5} dataSet={markdownCopyDataSet.h5}>
+          {children}
+        </View>
+      ),
+      heading6: (
+        node: ASTNode,
+        children: ReactNode[],
+        _parent: ASTNode[],
+        styles: MarkdownStyles,
+      ) => (
+        <View key={node.key} style={styles._VIEW_SAFE_heading6} dataSet={markdownCopyDataSet.h6}>
+          {children}
+        </View>
+      ),
+      blockquote: (
+        node: ASTNode,
+        children: ReactNode[],
+        _parent: ASTNode[],
+        styles: MarkdownStyles,
+      ) => (
+        <View
+          key={node.key}
+          style={styles._VIEW_SAFE_blockquote}
+          dataSet={markdownCopyDataSet.blockquote}
+        >
+          {children}
+        </View>
+      ),
+      hr: (node: ASTNode, _children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
+        <View key={node.key} style={styles._VIEW_SAFE_hr} dataSet={markdownCopyDataSet.hr} />
+      ),
+      table: (node: ASTNode, children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
+        <View key={node.key} style={styles._VIEW_SAFE_table} dataSet={markdownCopyDataSet.table}>
+          {children}
+        </View>
+      ),
+      thead: (node: ASTNode, children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
+        <View key={node.key} style={styles._VIEW_SAFE_thead} dataSet={markdownCopyDataSet.thead}>
+          {children}
+        </View>
+      ),
+      tbody: (node: ASTNode, children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
+        <View key={node.key} style={styles._VIEW_SAFE_tbody} dataSet={markdownCopyDataSet.tbody}>
+          {children}
+        </View>
+      ),
+      tr: (node: ASTNode, children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
+        <View key={node.key} style={styles._VIEW_SAFE_tr} dataSet={markdownCopyDataSet.tr}>
+          {children}
+        </View>
+      ),
       text: (
         node: ASTNode,
         _children: ReactNode[],
@@ -1497,6 +1663,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       ) => (
         <MarkdownInheritedText
           key={node.key}
+          copyTag="strong"
           inheritedStyles={inheritedStyles}
           textStyle={styles.strong}
         >
@@ -1512,6 +1679,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       ) => (
         <MarkdownInheritedText
           key={node.key}
+          copyTag="em"
           inheritedStyles={inheritedStyles}
           textStyle={styles.em}
         >
@@ -1527,6 +1695,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       ) => (
         <MarkdownInheritedText
           key={node.key}
+          copyTag="s"
           inheritedStyles={inheritedStyles}
           textStyle={styles.s}
         >
@@ -1547,7 +1716,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         _parent: ASTNode[],
         styles: MarkdownStyles,
       ) => (
-        <MarkdownTextSpan key={node.key} style={styles.hardbreak}>
+        <MarkdownTextSpan key={node.key} style={styles.hardbreak} copyTag="br">
           {"\n"}
         </MarkdownTextSpan>
       ),
@@ -1583,10 +1752,11 @@ export const AssistantMessage = memo(function AssistantMessage({
         styles: MarkdownStyles,
         inheritedStyles: TextStyle = {},
       ) => (
-        <HighlightedCodeBlock
+        <MarkdownFenceBlock
           key={node.key}
           code={node.content}
-          language={node.sourceInfo}
+          info={node.sourceInfo}
+          phase={phase}
           inheritedStyles={inheritedStyles}
           textStyle={styles.fence}
         />
@@ -1642,6 +1812,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         return (
           <MarkdownInheritedText
             key={node.key}
+            copyTag="code"
             inheritedStyles={inheritedStyles}
             textStyle={styles.code_inline}
             monoSurface
@@ -1659,6 +1830,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         <MarkdownListView
           key={node.key}
           baseStyle={styles.bullet_list}
+          copyTag="ul"
           spacing={getMarkdownListSpacing(node, parent)}
         >
           {children}
@@ -1673,6 +1845,8 @@ export const AssistantMessage = memo(function AssistantMessage({
         <MarkdownListView
           key={node.key}
           baseStyle={styles.ordered_list}
+          copyTag="ol"
+          orderedStart={node.attributes?.start}
           spacing={getMarkdownListSpacing(node, parent)}
         >
           {children}
@@ -1689,8 +1863,10 @@ export const AssistantMessage = memo(function AssistantMessage({
         const contentStyle = isOrdered ? styles.ordered_list_content : styles.bullet_list_content;
 
         return (
-          <View key={node.key} style={styles.list_item}>
-            <Text style={iconStyle}>{marker}</Text>
+          <View key={node.key} style={styles.list_item} dataSet={markdownCopyDataSet.li}>
+            <Text style={iconStyle} dataSet={markdownCopyDataSet.listMarker}>
+              {marker}
+            </Text>
             <MarkdownListItemContent contentStyle={contentStyle}>
               {children}
             </MarkdownListItemContent>
@@ -1699,12 +1875,22 @@ export const AssistantMessage = memo(function AssistantMessage({
       },
       th: (node: ASTNode, children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
         <MarkdownTableCellText key={node.key}>
-          <View style={styles._VIEW_SAFE_th}>{children}</View>
+          <View
+            style={styles._VIEW_SAFE_th}
+            dataSet={markdownCopyTableCellDataSet("th", node.attributes?.style)}
+          >
+            {children}
+          </View>
         </MarkdownTableCellText>
       ),
       td: (node: ASTNode, children: ReactNode[], _parent: ASTNode[], styles: MarkdownStyles) => (
         <MarkdownTableCellText key={node.key}>
-          <View style={styles._VIEW_SAFE_td}>{children}</View>
+          <View
+            style={styles._VIEW_SAFE_td}
+            dataSet={markdownCopyTableCellDataSet("td", node.attributes?.style)}
+          >
+            {children}
+          </View>
         </MarkdownTableCellText>
       ),
       paragraph: (
@@ -1727,13 +1913,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           source={getMarkdownLinkSource(node)}
           style={styles.link}
         >
-          {Children.map(children, (child) => {
-            if (!isValidElement(child)) return child;
-            const childProps = child.props as { style?: StyleProp<TextStyle> };
-            return cloneElement(child, {
-              style: [childProps.style, { color: styles.link.color }],
-            } as Partial<{ style: StyleProp<TextStyle> }>);
-          })}
+          {colorMarkdownLinkChildren(children, styles.link.color)}
         </AssistantMarkdownLink>
       ),
       image: (
@@ -1765,11 +1945,11 @@ export const AssistantMessage = memo(function AssistantMessage({
         );
       },
     };
-  }, [client, fileLinkActions, markdownParser, occurrenceKey, serverId, workspaceRoot]);
+  }, [client, fileLinkActions, markdownParser, occurrenceKey, phase, serverId, workspaceRoot]);
 
-  const blocks = useMemo(() => splitMarkdownBlocks(message), [message]);
+  const blocks = useMemo(() => splitMarkdownBlocks(revealedMessage), [revealedMessage]);
   const keyedBlocks = useMemo(
-    () => blocks.map((block, index) => ({ key: `${index}:${block.slice(0, 32)}`, block })),
+    () => blocks.map((block, index) => ({ key: `block:${index}`, block })),
     [blocks],
   );
 
@@ -1783,9 +1963,16 @@ export const AssistantMessage = memo(function AssistantMessage({
     ],
     [spacing],
   );
+  const revealDataSet = useMemo(
+    () =>
+      isRenderProfileEnabled()
+        ? { revealKey: occurrenceKey, revealLength: String(revealedMessage.length) }
+        : undefined,
+    [occurrenceKey, revealedMessage.length],
+  );
 
   return (
-    <View testID="assistant-message" style={assistantContainerStyle}>
+    <View testID="assistant-message" dataSet={revealDataSet} style={assistantContainerStyle}>
       {keyedBlocks.map(({ key, block }, index) => (
         <AssistantMessageBlockContainer
           key={key}
@@ -1800,6 +1987,14 @@ export const AssistantMessage = memo(function AssistantMessage({
           />
         </AssistantMessageBlockContainer>
       ))}
+      {fullMessageByteLength !== null ? (
+        <Text
+          testID="assistant-message-capped-notice"
+          style={assistantMessageStylesheet.cappedNotice}
+        >
+          {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
+        </Text>
+      ) : null}
     </View>
   );
 });
@@ -1831,8 +2026,8 @@ const speakMessageStylesheet = StyleSheet.create((theme) => ({
   },
   text: {
     fontFamily: theme.fontFamily.ui,
-    fontSize: theme.fontSize.base,
-    lineHeight: 22,
+    fontSize: theme.fontSize.content,
+    lineHeight: Math.round(theme.fontSize.content * 1.4),
     color: theme.colors.foreground,
   },
 }));
@@ -1863,41 +2058,28 @@ export const SpeakMessage = memo(function SpeakMessage({
   );
 });
 
-interface ActivityLogProps {
-  type: "system" | "info" | "success" | "error" | "artifact";
+interface NotificationProps {
+  level: "info" | "warning" | "error";
   message: string;
-  timestamp: number;
-  metadata?: Record<string, unknown>;
-  artifactId?: string;
-  artifactType?: string;
-  title?: string;
-  onArtifactClick?: (artifactId: string) => void;
   disableOuterSpacing?: boolean;
 }
 
-const activityLogStylesheet = StyleSheet.create((theme) => ({
-  pressable: {
+const notificationStylesheet = StyleSheet.create((theme) => ({
+  container: {
     borderRadius: theme.borderRadius.md,
     overflow: "hidden",
   },
-  pressableSpacing: {
+  containerSpacing: {
     marginBottom: theme.spacing[1],
   },
-  pressableActive: {
-    opacity: 0.7,
-  },
-  systemBg: {
-    backgroundColor: "rgba(39, 39, 42, 0.5)",
-  },
   infoBg: {
-    backgroundColor: "rgba(30, 58, 138, 0.3)",
+    backgroundColor: "rgba(147, 197, 253, 0.1)",
   },
-  successBg: {
-    backgroundColor: "rgba(20, 83, 45, 0.3)",
+  warningBg: {
+    backgroundColor: "rgba(245, 158, 11, 0.1)",
   },
-  errorBg: {},
-  artifactBg: {
-    backgroundColor: "rgba(30, 58, 138, 0.4)",
+  errorBg: {
+    backgroundColor: "rgba(239, 68, 68, 0.1)",
   },
   content: {
     paddingHorizontal: theme.spacing[3],
@@ -1917,137 +2099,63 @@ const activityLogStylesheet = StyleSheet.create((theme) => ({
     flex: 1,
   },
   messageText: {
-    fontSize: theme.fontSize.sm,
-    lineHeight: 20,
-  },
-  detailsRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginTop: theme.spacing[1],
-  },
-  detailsText: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.xs,
-    marginRight: theme.spacing[1],
-  },
-  metadataContainer: {
-    marginTop: theme.spacing[2],
-    backgroundColor: "rgba(0, 0, 0, 0.5)",
-    borderRadius: theme.borderRadius.base,
-    padding: theme.spacing[2],
-    borderWidth: theme.borderWidth[1],
-    borderColor: theme.colors.border,
-  },
-  metadataText: {
     color: theme.colors.foreground,
-    fontSize: theme.fontSize.code,
-    fontFamily: theme.fontFamily.mono,
-    lineHeight: 16,
+    fontSize: theme.fontSize.base,
+    lineHeight: 20,
   },
 }));
 
-export const ActivityLog = memo(function ActivityLog({
-  type,
+export const Notification = memo(function Notification({
+  level,
   message,
-  timestamp: _timestamp,
-  metadata,
-  artifactId,
-  artifactType,
-  title,
-  onArtifactClick,
   disableOuterSpacing,
-}: ActivityLogProps) {
-  const { t } = useTranslation();
+}: NotificationProps) {
   const resolvedDisableOuterSpacing = useDisableOuterSpacing(disableOuterSpacing);
-  const [isExpanded, setIsExpanded] = useState(false);
 
   const typeConfig = {
-    system: {
-      bg: activityLogStylesheet.systemBg,
-      color: "#a1a1aa",
-      Icon: Circle,
+    info: {
+      bg: notificationStylesheet.infoBg,
+      iconColorMapping: infoColorMapping,
+      Icon: ThemedNotificationInfo,
     },
-    info: { bg: activityLogStylesheet.infoBg, color: "#60a5fa", Icon: Info },
-    success: {
-      bg: activityLogStylesheet.successBg,
-      color: "#4ade80",
-      Icon: CheckCircle,
+    warning: {
+      bg: notificationStylesheet.warningBg,
+      iconColorMapping: warningColorMapping,
+      Icon: ThemedNotificationWarning,
     },
     error: {
-      bg: activityLogStylesheet.errorBg,
-      color: "#f87171",
-      Icon: XCircle,
-    },
-    artifact: {
-      bg: activityLogStylesheet.artifactBg,
-      color: "#93c5fd",
-      Icon: FileText,
+      bg: notificationStylesheet.errorBg,
+      iconColorMapping: destructiveColorMapping,
+      Icon: ThemedNotificationError,
     },
   };
 
-  const config = typeConfig[type];
+  const config = typeConfig[level];
   const IconComponent = config.Icon;
 
-  const handlePress = useCallback(() => {
-    if (type === "artifact" && artifactId && onArtifactClick) {
-      onArtifactClick(artifactId);
-    } else if (metadata) {
-      setIsExpanded((prev) => !prev);
-    }
-  }, [type, artifactId, onArtifactClick, metadata]);
-
-  const displayMessage =
-    type === "artifact" && artifactType && title ? `${artifactType}: ${title}` : message;
-
-  const isInteractive = type === "artifact" || metadata;
-  const pressableStyle = useMemo(
+  const containerStyle = useMemo(
     () => [
-      activityLogStylesheet.pressable,
-      !resolvedDisableOuterSpacing && activityLogStylesheet.pressableSpacing,
+      notificationStylesheet.container,
+      !resolvedDisableOuterSpacing && notificationStylesheet.containerSpacing,
       config.bg,
-      isInteractive && activityLogStylesheet.pressableActive,
     ],
-    [resolvedDisableOuterSpacing, config.bg, isInteractive],
+    [resolvedDisableOuterSpacing, config.bg],
   );
-  const messageTextStyle = useMemo(
-    () => [activityLogStylesheet.messageText, { color: config.color }],
-    [config.color],
-  );
-
   return (
-    <Pressable onPress={handlePress} disabled={!isInteractive} style={pressableStyle}>
-      <View style={activityLogStylesheet.content}>
-        <View style={activityLogStylesheet.row}>
-          <View style={activityLogStylesheet.iconContainer}>
-            <IconComponent size={16} color={config.color} />
+    <View style={containerStyle}>
+      <View style={notificationStylesheet.content}>
+        <View style={notificationStylesheet.row}>
+          <View style={notificationStylesheet.iconContainer}>
+            <IconComponent size={16} uniProps={config.iconColorMapping} />
           </View>
-          <View style={activityLogStylesheet.textContainer}>
-            <Text style={messageTextStyle} selectable>
-              {displayMessage}
+          <View style={notificationStylesheet.textContainer}>
+            <Text style={notificationStylesheet.messageText} selectable>
+              {message}
             </Text>
-            {metadata && (
-              <View style={activityLogStylesheet.detailsRow}>
-                <Text style={activityLogStylesheet.detailsText}>
-                  {t("message.activity.details")}
-                </Text>
-                {isExpanded ? (
-                  <ChevronDown size={12} color="#71717a" />
-                ) : (
-                  <ChevronRight size={12} color="#71717a" />
-                )}
-              </View>
-            )}
           </View>
         </View>
-        {isExpanded && metadata && (
-          <View style={activityLogStylesheet.metadataContainer} dataSet={CODE_SURFACE_DATASET}>
-            <Text style={activityLogStylesheet.metadataText}>
-              {JSON.stringify(metadata, null, 2)}
-            </Text>
-          </View>
-        )}
       </View>
-    </Pressable>
+    </View>
   );
 });
 
@@ -2107,38 +2215,21 @@ export const CompactionMarker = memo(function CompactionMarker({
 
 interface TodoListCardProps {
   items: TodoEntry[];
+  activity: TaskActivity;
   disableOuterSpacing?: boolean;
 }
 
-interface TodoListItemRowProps {
-  text: string;
-  completed: boolean;
-}
-
-function TodoListItemRow({ text, completed }: TodoListItemRowProps) {
-  const badgeStyle = useMemo(
-    () => [
-      todoListCardStylesheet.radioBadge,
-      completed
-        ? todoListCardStylesheet.radioBadgeComplete
-        : todoListCardStylesheet.radioBadgeIncomplete,
-    ],
-    [completed],
-  );
-  const textStyle = useMemo(
-    () => [todoListCardStylesheet.itemText, completed && todoListCardStylesheet.itemTextCompleted],
-    [completed],
-  );
-  return (
-    <View style={todoListCardStylesheet.itemRow}>
-      <View style={badgeStyle}>
-        {completed ? (
-          <ThemedTodoCheckIcon size={12} uniProps={primaryForegroundColorMapping} />
-        ) : null}
-      </View>
-      <Text style={textStyle}>{text}</Text>
-    </View>
-  );
+function taskActivityIcon(activity: TaskActivity) {
+  switch (activity.type) {
+    case "added":
+      return Plus;
+    case "started":
+      return CircleDot;
+    case "completed":
+      return Check;
+    default:
+      return CheckSquare;
+  }
 }
 
 const todoListCardStylesheet = StyleSheet.create((theme) => ({
@@ -2148,34 +2239,6 @@ const todoListCardStylesheet = StyleSheet.create((theme) => ({
   list: {
     gap: theme.spacing[1],
   },
-  itemRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[2],
-  },
-  radioBadge: {
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    backgroundColor: theme.colors.foregroundMuted,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  radioBadgeIncomplete: {
-    opacity: 0.55,
-  },
-  radioBadgeComplete: {
-    opacity: 0.95,
-  },
-  itemText: {
-    flex: 1,
-    color: theme.colors.foreground,
-    fontSize: theme.fontSize.base,
-  },
-  itemTextCompleted: {
-    color: theme.colors.foregroundMuted,
-    textDecorationLine: "line-through",
-  },
   emptyText: {
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.base,
@@ -2184,12 +2247,23 @@ const todoListCardStylesheet = StyleSheet.create((theme) => ({
 
 export const TodoListCard = memo(function TodoListCard({
   items,
+  activity,
   disableOuterSpacing,
 }: TodoListCardProps) {
   const { t } = useTranslation();
   const [isExpanded, setIsExpanded] = useState(false);
-
-  const nextTask = useMemo(() => items.find((item) => !item.completed)?.text, [items]);
+  const activityDisplay = useMemo(() => {
+    if (activity.type === "created") {
+      return {
+        label: t("message.todo.activity.created", { count: activity.count }),
+        secondaryLabel: undefined,
+      };
+    }
+    return {
+      label: t(`message.todo.activity.${activity.type}`),
+      secondaryLabel: activity.task,
+    };
+  }, [activity, t]);
 
   const handleToggle = useCallback(() => {
     setIsExpanded((prev) => !prev);
@@ -2202,9 +2276,7 @@ export const TodoListCard = memo(function TodoListCard({
           {items.length === 0 ? (
             <Text style={todoListCardStylesheet.emptyText}>{t("message.todo.empty")}</Text>
           ) : (
-            items.map((item) => (
-              <TodoListItemRow key={item.text} text={item.text} completed={item.completed} />
-            ))
+            items.map((item) => <TaskListRow key={item.id ?? item.text} task={item} />)
           )}
         </View>
       </View>
@@ -2213,9 +2285,9 @@ export const TodoListCard = memo(function TodoListCard({
 
   return (
     <ExpandableBadge
-      label={t("message.todo.title")}
-      secondaryLabel={nextTask}
-      icon={CheckSquare}
+      label={activityDisplay.label}
+      secondaryLabel={activityDisplay.secondaryLabel}
+      icon={taskActivityIcon(activity)}
       isExpanded={isExpanded}
       onToggle={handleToggle}
       renderDetails={renderDetails}
@@ -3012,6 +3084,7 @@ export const ToolCall = memo(function ToolCall({
   const handleToggle = useCallback(() => {
     if (!shouldRenderInline) {
       openToolCall({
+        toolName,
         displayName: presentation.displayName,
         summary: presentation.summary,
         detail: effectiveDetail,
@@ -3025,6 +3098,7 @@ export const ToolCall = memo(function ToolCall({
   }, [
     shouldRenderInline,
     openToolCall,
+    toolName,
     presentation.displayName,
     presentation.summary,
     presentation.errorText,
@@ -3065,6 +3139,7 @@ export const ToolCall = memo(function ToolCall({
     if (!shouldRenderInline) return null;
     return (
       <ToolCallDetailsContent
+        toolName={toolName}
         detail={effectiveDetail}
         errorText={presentation.errorText}
         maxHeight={maxDetailHeight}
@@ -3073,6 +3148,7 @@ export const ToolCall = memo(function ToolCall({
     );
   }, [
     shouldRenderInline,
+    toolName,
     effectiveDetail,
     presentation.errorText,
     presentation.isLoadingDetails,

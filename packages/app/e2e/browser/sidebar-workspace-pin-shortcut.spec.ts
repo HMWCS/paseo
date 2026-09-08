@@ -1,8 +1,13 @@
 import { test, expect, type Page } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
 import { daemonWsRoutePattern } from "../support/helpers/daemon-port";
+import {
+  expectNewWorkspaceProjectSelected,
+  openNewWorkspaceComposer,
+} from "../support/helpers/new-workspace";
 import { seedWorkspace, type SeededWorkspace } from "../support/helpers/seed-client";
 import { getServerId } from "../support/helpers/server-id";
+import { selectSidebarStatusGrouping } from "../support/helpers/sidebar";
 
 // The pin shortcut used to be registered by the sidebar row itself, so it silently did nothing
 // whenever the row was unmounted — a collapsed project section being the common case. It now
@@ -39,8 +44,7 @@ async function collapseProjectSection(page: Page, project: SeededWorkspace): Pro
 }
 
 async function switchToStatusGrouping(page: Page): Promise<void> {
-  await page.getByTestId("sidebar-display-preferences-menu").click();
-  await page.getByTestId("sidebar-grouping-status").click();
+  await selectSidebarStatusGrouping(page);
   await expect(page.getByTestId("sidebar-status-list-scroll")).toBeVisible({ timeout: 10_000 });
 }
 
@@ -142,6 +146,42 @@ async function installPinRpcGate(
 }
 
 test.describe("Pin workspace shortcut", () => {
+  test("dispatches pin once and keeps project creation reachable", async ({ page }) => {
+    const workspace = await seedWorkspace({
+      repoPrefix: "pin-project-creation-",
+      title: "Pinned workspace",
+    });
+
+    try {
+      const gate = await installPinRpcGate(page);
+
+      await gotoAppShell(page);
+      await openWorkspace(page, workspace.workspaceId);
+
+      await test.step("sends one RPC for each pin transition", async () => {
+        await page.keyboard.press(PIN_SHORTCUT);
+        await expect(pinnedSection(page)).toBeVisible({ timeout: 10_000 });
+        expect(gate.sentCount()).toBe(1);
+
+        await page.keyboard.press(PIN_SHORTCUT);
+        await expect(pinnedSection(page)).toHaveCount(0, { timeout: 10_000 });
+        expect(gate.sentCount()).toBe(2);
+        await expect(workspaceRow(page, workspace.workspaceId)).toHaveCount(1);
+      });
+
+      await test.step("keeps the pinned project available to workspace creation", async () => {
+        await page.keyboard.press(PIN_SHORTCUT);
+        await expect(pinnedSection(page)).toBeVisible({ timeout: 10_000 });
+        expect(gate.sentCount()).toBe(3);
+
+        await openNewWorkspaceComposer(page, workspace);
+        await expectNewWorkspaceProjectSelected(page, workspace.projectDisplayName);
+      });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
   test("pins the active workspace while its project section is collapsed", async ({ page }) => {
     const workspace = await seedWorkspace({ repoPrefix: "pin-shortcut-collapsed-" });
 
@@ -179,34 +219,6 @@ test.describe("Pin workspace shortcut", () => {
       await page.keyboard.press(PIN_SHORTCUT);
 
       await expect(pinnedSection(page)).toHaveCount(0, { timeout: 10_000 });
-    } finally {
-      await workspace.cleanup();
-    }
-  });
-
-  test("sends exactly one pin RPC per press when the row is rendered and selected", async ({
-    page,
-  }) => {
-    const workspace = await seedWorkspace({ repoPrefix: "pin-shortcut-expanded-" });
-
-    try {
-      const gate = await installPinRpcGate(page);
-
-      await gotoAppShell(page);
-      await openWorkspace(page, workspace.workspaceId);
-
-      await page.keyboard.press(PIN_SHORTCUT);
-      await expect(pinnedSection(page)).toBeVisible({ timeout: 10_000 });
-      // Counting frames catches a press that produces zero or two RPCs — a misfiring in-flight
-      // guard, or a second dispatch path. It cannot detect a duplicate handler registration:
-      // `keyboardActionDispatcher.dispatch` returns at the first handler that returns true, so a
-      // shadowed second handler is unobservable from outside by design.
-      expect(gate.sentCount()).toBe(1);
-
-      await page.keyboard.press(PIN_SHORTCUT);
-      await expect(pinnedSection(page)).toHaveCount(0, { timeout: 10_000 });
-      expect(gate.sentCount()).toBe(2);
-      await expect(workspaceRow(page, workspace.workspaceId)).toHaveCount(1);
     } finally {
       await workspace.cleanup();
     }

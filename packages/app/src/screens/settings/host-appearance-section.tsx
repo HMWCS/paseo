@@ -11,9 +11,9 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AdaptiveRenameModal } from "@/components/rename-modal";
-import { HostBadge } from "@/components/sidebar/host-badge";
+import { WorkspaceMetaRow } from "@/components/sidebar/workspace-meta-row";
 import { useToast } from "@/contexts/toast-context";
-import { SettingsSection } from "@/screens/settings/settings-section";
+import { SettingsSection } from "@/components/settings/headings/settings-section";
 import {
   HOST_BADGE_DISPLAYS,
   HOST_COLORS,
@@ -223,19 +223,31 @@ function BadgePreview({
   badgeDisplay: HostBadgeDisplay;
 }) {
   const { t } = useTranslation();
+  const hostBadge = useMemo(
+    () =>
+      badgeDisplay === "hidden"
+        ? null
+        : {
+            serverId: host.serverId,
+            label: host.label,
+            color: host.appearance.color,
+            showLabel: badgeDisplay === "name",
+          },
+    [badgeDisplay, host.serverId, host.label, host.appearance.color],
+  );
+  // The real sidebar row, so the preview can't drift from what the setting actually does.
   return (
     <View style={styles.preview} testID="host-appearance-preview">
       <Text style={styles.previewTitle} numberOfLines={1}>
         {t("settings.host.appearance.preview.workspaceName")}
       </Text>
-      {badgeDisplay === "hidden" ? null : (
-        <HostBadge
-          serverId={host.serverId}
-          label={host.label}
-          color={host.appearance.color}
-          showLabel={badgeDisplay === "name"}
-        />
-      )}
+      <WorkspaceMetaRow
+        currentBranch={null}
+        projectName={null}
+        hostBadge={hostBadge}
+        prHint={null}
+        serviceSummary={null}
+      />
     </View>
   );
 }
@@ -315,7 +327,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   triggerText: {
     color: theme.colors.foreground,
-    fontSize: theme.fontSize.sm,
+    fontSize: theme.fontSize.base,
   },
   swatch: {
     width: ICON_SIZE.md,
@@ -336,13 +348,13 @@ const styles = StyleSheet.create((theme) => ({
   },
   nameText: {
     color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
+    fontSize: theme.fontSize.base,
     flexShrink: 1,
   },
   preview: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[2],
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: theme.spacing[1],
     paddingVertical: theme.spacing[3],
     paddingHorizontal: theme.spacing[4],
     borderTopWidth: theme.borderWidth[1],
@@ -351,7 +363,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   previewTitle: {
     color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
+    fontSize: theme.fontSize.base,
     flexShrink: 1,
   },
 }));
