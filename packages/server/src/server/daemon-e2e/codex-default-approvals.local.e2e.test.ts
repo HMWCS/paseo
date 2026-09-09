@@ -56,6 +56,10 @@ async function createApprovalHarness(context: TestContext, scenario: ApprovalSce
   context.onTestFinished(() => client.close());
   const collector = createMessageCollector(client);
   context.onTestFinished(() => collector.unsubscribe());
+  const permissionRequests: unknown[] = [];
+  context.onTestFinished(
+    client.on("agent_permission_request", (message) => permissionRequests.push(message)),
+  );
   await client.connect();
   await client.fetchAgents({ subscribe: { subscriptionId: "default-approvals" } });
   const agent = await client.createAgent({
@@ -73,7 +77,7 @@ async function createApprovalHarness(context: TestContext, scenario: ApprovalSce
       },
     },
   });
-  return { client, agent, root, records, collector };
+  return { client, agent, root, records, collector, permissionRequests };
 }
 
 type ApprovalHarness = Awaited<ReturnType<typeof createApprovalHarness>>;
@@ -89,9 +93,10 @@ function approvalPrompt(marker: string): string {
 }
 
 async function expectUserApproval(context: TestContext, harness: ApprovalHarness) {
-  const { client, agent, records, collector, root } = harness;
+  const { client, agent, records, collector, root, permissionRequests } = harness;
   records.length = 0;
   collector.clear();
+  permissionRequests.length = 0;
   const marker = path.join(root, "user-approved.txt");
   await client.sendAgentMessage(agent.id, approvalPrompt("user-approved.txt"));
   const pending = await client.waitForFinish(agent.id, 120_000);
@@ -129,7 +134,7 @@ async function expectUserApproval(context: TestContext, harness: ApprovalHarness
     ]),
   );
   expect(records.map((record) => record.method)).not.toContain("item/autoApprovalReview/started");
-  expect(collector.messages).toEqual(
+  expect(permissionRequests).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         type: "agent_permission_request",
@@ -164,15 +169,13 @@ test("Default Permissions waits for the user with global auto-review configured"
 
 test("switching from Auto-review to Default waits for the user on the same thread", async (context) => {
   const harness = await createApprovalHarness(context, { reviewer: "user", modeId: "auto-review" });
-  const { client, agent, records, collector, root } = harness;
+  const { client, agent, records, root, permissionRequests } = harness;
   await client.sendAgentMessage(agent.id, approvalPrompt("auto-approved.txt"));
   const first = await client.waitForFinish(agent.id, 120_000);
   expect(first.status).toBe("idle");
   expect(readFileSync(path.join(root, "auto-approved.txt"), "utf8")).toBe("approved");
   expect(records.map((record) => record.method)).toContain("item/autoApprovalReview/completed");
-  expect(collector.messages.map((message) => message.type)).not.toContain(
-    "agent_permission_request",
-  );
+  expect(permissionRequests).toEqual([]);
   const threadId = z
     .string()
     .parse(records.find((record) => record.method === "turn/started")?.sessionId);
