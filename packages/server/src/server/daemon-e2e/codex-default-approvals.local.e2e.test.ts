@@ -12,6 +12,7 @@ import { CodexAppServerAgentClient } from "../agent/providers/codex-app-server-a
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createMessageCollector } from "../test-utils/message-collector.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
+import { createCodexApprovalFixture } from "../test-utils/codex-approval-fixture.js";
 
 interface ApprovalScenario {
   reviewer: "user" | "auto_review";
@@ -27,6 +28,7 @@ async function createApprovalHarness(context: TestContext, scenario: ApprovalSce
     path.join(cwd, "write-marker.cjs"),
     'require("node:fs").writeFileSync(process.argv[2], "approved");\n',
   );
+  const fixture = await createCodexApprovalFixture({ context, root, modeId: scenario.modeId });
 
   const records: Record<string, unknown>[] = [];
   const logger = pino(
@@ -39,11 +41,12 @@ async function createApprovalHarness(context: TestContext, scenario: ApprovalSce
       },
     }),
   );
-  // A process-wide config override keeps the user's config.toml and login untouched.
+  // Only model output is scripted; Codex, its sandbox, and Paseo's approval path are real.
   const daemon = await createTestPaseoDaemon({
     logger,
     agentClients: {
       codex: new CodexAppServerAgentClient(logger, {
+        env: { CODEX_HOME: fixture.codexHome },
         command: { mode: "append", args: ["-c", `approvals_reviewer="${scenario.reviewer}"`] },
       }),
     },
@@ -61,6 +64,7 @@ async function createApprovalHarness(context: TestContext, scenario: ApprovalSce
     modeId: scenario.modeId,
     title: "Default Permissions approval regression",
     thinkingOptionId: "low",
+    model: "mock-model",
     providerOptions: {
       sandbox_workspace_write: {
         writable_roots: [],
@@ -91,10 +95,11 @@ async function expectUserApproval(context: TestContext, harness: ApprovalHarness
   const marker = path.join(root, "user-approved.txt");
   await client.sendAgentMessage(agent.id, approvalPrompt("user-approved.txt"));
   const pending = await client.waitForFinish(agent.id, 120_000);
-  await context.annotate(
-    JSON.stringify({ status: pending.status, fileExists: existsSync(marker), records }),
-    "codex-before-user-response",
-  );
+  context.task.meta.beforeUserResponse = structuredClone({
+    status: pending.status,
+    fileExists: existsSync(marker),
+    records,
+  });
   expect(pending.status).toBe("permission");
 
   // A second RPC observes the same unresolved request before the client responds.
@@ -104,6 +109,10 @@ async function expectUserApproval(context: TestContext, harness: ApprovalHarness
   expect(snapshot.currentModeId).toBe("auto");
   expect(snapshot.pendingPermissions).toHaveLength(1);
   expect(snapshot.pendingPermissions).toEqual(pending.final?.pendingPermissions);
+  context.task.meta.pendingApproval = structuredClone({
+    pendingPermissions: snapshot.pendingPermissions,
+    websocketMessages: collector.messages,
+  });
   const permission = snapshot.pendingPermissions[0];
   expect(permission.kind).toBe("tool");
   expect(existsSync(marker)).toBe(false);
@@ -137,16 +146,14 @@ async function expectUserApproval(context: TestContext, harness: ApprovalHarness
   const after = await client.fetchAgent({ agentId: agent.id });
   assert(after, "The agent must remain available after approval");
   expect(after.agent.pendingPermissions).toEqual([]);
-  await context.annotate(
-    JSON.stringify({
-      threadId,
-      requestId: permission.id,
-      decision: "allow",
-      status: finished.status,
-      fileContent: readFileSync(marker, "utf8"),
-    }),
-    "codex-after-user-response",
-  );
+  context.task.meta.afterUserResponse = {
+    threadId,
+    requestId: permission.id,
+    decision: "allow",
+    status: finished.status,
+    fileContent: readFileSync(marker, "utf8"),
+    pendingPermissions: after.agent.pendingPermissions,
+  };
   return threadId;
 }
 
@@ -169,7 +176,7 @@ test("switching from Auto-review to Default waits for the user on the same threa
   const threadId = z
     .string()
     .parse(records.find((record) => record.method === "turn/started")?.sessionId);
-  await context.annotate(JSON.stringify({ threadId, records }), "codex-auto-review-turn");
+  context.task.meta.autoReviewTurn = structuredClone({ threadId, records });
   await client.setAgentMode(agent.id, "auto");
   expect(await expectUserApproval(context, harness)).toBe(threadId);
   expect(records.map((record) => record.method)).not.toContain("thread/started");
